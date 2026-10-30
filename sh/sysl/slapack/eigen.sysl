@@ -1,7 +1,7 @@
 module sh.sysl.slapack
 @no_alloc
 
-import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWorkLen, Uplo, view, view_mut, axpy, dot, rot, scal, swap}
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWorkLen, Uplo, view, view_mut, axpy, dot, rot, scal, swap, symv, syr2}
 import sysl.math.{min, max}
 
 // The symmetric eigenproblem, A = V Λ Vᵀ, by LAPACK's path: `sytrd` reduces A to a tridiagonal T =
@@ -141,30 +141,6 @@ private laev2[T: Real](a: T, b: T, c: T) -> (T, T, T, T)
         sn1 = tn
     (rt1, rt2, cs1, sn1)
 
-/** y := α A x for the `m` x `m` symmetric A of which only the lower triangle of `a` is read: BLAS's
- * `symv`, which sblas does not have. Each column below the diagonal is one `axpy` into y and one `dot`
- * with x, so that the triangle is read once.
- */
-private symv_lower[T: Real](alpha: T, a: Matrix[T], x: []const T, y: []T)
-    val m = a.rows
-    for k in 0..<m do y[k] = T.zero()
-    for j in 0..<m
-        y[j] = y[j] + alpha * a.at(j, j) * x[j]
-        if j + 1 < m
-            val below = a.block(j + 1, j, m - j - 1, 1).col(0)
-            axpy(alpha * x[j], below, view_mut(y[j + 1..<m]))
-            y[j] = y[j] + alpha * dot(below, view(x[j + 1..<m]))
-
-/** A += α (x yᵀ + y xᵀ) on the lower triangle of `a`, the other never touched: BLAS's `syr2`, which
- * sblas does not have; two `axpy`s per column.
- */
-private syr2_lower[T: Real](alpha: T, x: []const T, y: []const T, a: MatrixMut[T])
-    val m = a.rows
-    for j in 0..<m
-        val col = a.block(j, j, m - j, 1).col(0)
-        axpy(alpha * y[j], view(x[j..<m]), col)
-        axpy(alpha * x[j], view(y[j..<m]), col)
-
 /** The reduction of the lower triangle of `l`, LAPACK's `sytd2` from `Lower`, with `work` at least
  * `2 (n − 1)` long.
  */
@@ -183,10 +159,10 @@ private tridiagonalise[T: Real](l: MatrixMut[T], d: []T, e: []T, tau: []T, work:
             for k in 1..<m do v[k] = l.at(i + 1 + k, i)
             // A₂₂ := H A₂₂ H = A₂₂ − v wᵀ − w vᵀ, with x = τ A₂₂ v and w = x − ½ τ (xᵀ v) v.
             val a22 = l.block(i + 1, i + 1, m, m)
-            symv_lower(ti, a22.as_view(), v, w)
+            symv(Uplo.Lower, ti, a22.as_view(), view(v), T.zero(), view_mut(w))
             val alpha = -(ti / T(2)) * dot(view(w), view(v))
             axpy(alpha, view(v), view_mut(w))
-            syr2_lower(-T.one(), v, w, a22)
+            syr2(Uplo.Lower, -T.one(), view(v), view(w), a22)
         l.set(i + 1, i, beta)
         d[i] = l.at(i, i)
         tau[i] = ti

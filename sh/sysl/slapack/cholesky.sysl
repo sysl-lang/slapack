@@ -1,7 +1,7 @@
 module sh.sysl.slapack
 @no_alloc
 
-import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, GemmWorkLen, Side, Uplo, Diag, gemm, gemm_work_len, trsm, trsm_work_len, gemv, dot, scal}
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, GemmWorkLen, Side, Uplo, Diag, gemm, gemm_work_len, trsm, trsm_work_len, syrk, syrk_work_len, gemv, dot, scal}
 import sysl.math.{min, max}
 
 // The Cholesky factorisation of a symmetric positive definite matrix, A = L Lᵀ or A = Uᵀ U, and the
@@ -12,33 +12,32 @@ import sysl.math.{min, max}
 // so `Upper` is the lower factorisation of the transposed view: the algorithm is written once.
 //
 // `potrf` is LAPACK's left-looking blocked algorithm. Each step brings a block of `chol_block` columns up
-// to date with every column left of it — its diagonal block in the unblocked kernel, its rows below by
-// one `gemm` — and then finishes the rows below with a `trsm` against the block's own factor.
+// to date with every column left of it — its diagonal block by one `syrk`, its rows below by one `gemm`
+// — then factors the diagonal block unblocked and finishes the rows below with a `trsm` against that
+// block's factor.
 
 /** The width of the block `potrf` factors unblocked: LAPACK's default block size for `potrf`. */
 private[slapack] const chol_block: usize = 64
 
-/** The lower factor of an `r` x `r` diagonal block whose rows are those of `a` and whose columns start
- * at column `k` of it, left-looking: the first `k` columns of `a` are those rows of the factor already
- * computed, and each column of the block subtracts their contribution before it is scaled. With `k`
- * zero this is LAPACK's `potf2`. Answers the first column of the block whose diagonal came out not
- * positive, which is left holding that value; the columns right of it are not touched.
+/** The lower factor of the square `a`, LAPACK's `potf2` from `Lower`: each column subtracts the
+ * contribution of the columns of the factor left of it before it is scaled. Answers the first column
+ * whose diagonal came out not positive, which is left holding that value; the columns right of it are
+ * not touched.
  */
-private unblocked[T: Real](a: MatrixMut[T], k: usize) -> Option[usize]
+private unblocked[T: Real](a: MatrixMut[T]) -> Option[usize]
     val r = a.rows
     for c in 0..<r
-        val col = k + c
-        val done = a.as_view().block(c, 0, 1, col).row(0)
-        val ajj = a.at(c, col) - dot(done, done)
+        val done = a.as_view().block(c, 0, 1, c).row(0)
+        val ajj = a.at(c, c) - dot(done, done)
         if ajj <= T.zero() || ajj.is_nan()
-            a.set(c, col, ajj)
+            a.set(c, c, ajj)
             return Some(c)
         val d = ajj.sqrt()
-        a.set(c, col, d)
+        a.set(c, c, d)
         if c + 1 < r
             // The column below the diagonal: subtract the rows' dot products with this row, then scale.
-            val below = a.block(c + 1, col, r - c - 1, 1).col(0)
-            gemv(-T.one(), a.as_view().block(c + 1, 0, r - c - 1, col), done, T.one(), below)
+            val below = a.block(c + 1, c, r - c - 1, 1).col(0)
+            gemv(-T.one(), a.as_view().block(c + 1, 0, r - c - 1, c), done, T.one(), below)
             scal(T.one() / d, below)
     None
 
@@ -54,7 +53,7 @@ private[slapack] lower_of[T](uplo: Uplo, a: MatrixMut[T]) -> MatrixMut[T] = if u
  */
 potf2[T: Real](uplo: Uplo, a: MatrixMut[T]) -> Result[unit, Error]
     assert(a.rows == a.cols, "potf2 factors a square matrix")
-    if unblocked(lower_of(uplo, a), 0) is Some(j) then return Err(Error.NotPositiveDefinite(j))
+    if unblocked(lower_of(uplo, a)) is Some(j) then return Err(Error.NotPositiveDefinite(j))
     Ok(())
 
 /** How many elements each of the two `GemmWork` buffers `potrf` takes needs, for an order-`n` A. A
@@ -62,11 +61,13 @@ potf2[T: Real](uplo: Uplo, a: MatrixMut[T]) -> Result[unit, Error]
  */
 potrf_work_len[T: Real](n: usize) -> GemmWorkLen
     if n <= chol_block then return GemmWorkLen(0, 0)
-    // No update is taller than the rows below the first block or reaches back further than that.
+    // No update below a diagonal block is taller than the rows below the first block or reaches back
+    // further than that; the diagonal block's own reaches back to the start of the last block.
     val rest = n - chol_block
     val solve = trsm_work_len[T](Side.Right, rest, chol_block)
     val update = gemm_work_len[T](rest, chol_block, rest)
-    GemmWorkLen(max(solve.a, update.a), max(solve.b, update.b))
+    val diagonal = syrk_work_len[T](chol_block, (n - 1) / chol_block * chol_block)
+    GemmWorkLen(max(max(solve.a, update.a), diagonal.a), max(max(solve.b, update.b), diagonal.b))
 
 /** LAPACK's `potrf`: the Cholesky factorisation of a symmetric positive definite A, blocked.
  *
@@ -86,13 +87,15 @@ potrf[T: Real](uplo: Uplo, a: MatrixMut[T], work: GemmWork[T]) -> Result[unit, E
     val l = lower_of(uplo, a)
     for var j = 0; j < n; j += chol_block
         val jb = min(n - j, chol_block)
-        // The diagonal block, brought up to date with the columns left of it and factored.
-        if unblocked(l.block(j, 0, jb, j + jb), j) is Some(c) then return Err(Error.NotPositiveDefinite(j + c))
+        // The diagonal block: A₁₁ -= L₁₀ L₁₀ᵀ on its lower triangle, then L₁₁ by potf2.
+        val done = l.as_view()
+        val l11 = l.block(j, j, jb, jb)
+        syrk(Uplo.Lower, -T.one(), done.block(j, 0, jb, j), T.one(), l11, work)
+        if unblocked(l11) is Some(c) then return Err(Error.NotPositiveDefinite(j + c))
         if j + jb < n
             val below = n - j - jb
             val l21 = l.block(j + jb, j, below, jb)
             // A₂₁ -= L₂₀ L₁₀ᵀ, then L₂₁ = A₂₁ L₁₁⁻ᵀ.
-            val done = l.as_view()
             gemm(-T.one(), done.block(j + jb, 0, below, j), done.block(j, 0, jb, j).t(), T.one(), l21, work)
             trsm(Side.Right, Uplo.Upper, Diag.NonUnit, T.one(), done.block(j, j, jb, jb).t(), l21, work)
     Ok(())

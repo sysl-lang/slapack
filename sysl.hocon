@@ -16,5 +16,5 @@ optimization = "2"
 workspace = ["oracle"]
 
 dependencies {
-  sblas { git = "github.com/sysl-lang/sblas", version = "0.3.0" }
+  sblas { git = "github.com/sysl-lang/sblas", version = "0.4.0" }
 }

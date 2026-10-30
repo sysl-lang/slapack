@@ -1,7 +1,7 @@
 module sh.sysl.slapack
 @no_alloc
 
-import sh.sysl.sblas.{Real, Matrix, MatrixMut, Strided, StridedMut, GemmWork, GemmWorkLen, Side, Uplo, Diag, matrix_mut, view_mut, gemm, gemm_work_len, gemv, ger, axpy, copy, dot, nrm2, scal}
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, Strided, StridedMut, GemmWork, GemmWorkLen, Side, Uplo, Diag, matrix_mut, view_mut, gemm, gemm_work_len, trmm, trmm_work_len, gemv, ger, axpy, copy, dot, nrm2, scal}
 import sysl.math.{min, max}
 
 // The QR factorisation, A = Q R, by Householder reflections, and the routines that form Q or apply it.
@@ -37,15 +37,17 @@ struct QrWorkLen
 
 /** The workspace of a routine that applies `k` reflectors of length `rows` to `cols` columns: one
  * vector of `cols` unblocked; blocked, a `qr_block` square factor and a `cols` x `qr_block` product,
- * and the buffers of `larfb`'s two `gemm`s for the first, widest block.
+ * and the buffers of `larfb`'s two `gemm`s and three `trmm`s for the first, widest block.
  */
 private work_len[T: Real](rows: usize, cols: usize, k: usize) -> QrWorkLen
     if k == 0 || cols == 0 then return QrWorkLen(0, GemmWorkLen(0, 0))
     if k <= qr_block then return QrWorkLen(cols, GemmWorkLen(0, 0))
-    // W += C₂ᵀ V₂ is cols x qr_block over rows − qr_block; C₂ −= V₂ Wᵀ is rows − qr_block x cols over qr_block.
+    // W += C₂ᵀ V₂ is cols x qr_block over rows − qr_block; C₂ −= V₂ Wᵀ is rows − qr_block x cols over
+    // qr_block; each trmm multiplies the cols x qr_block W from the right.
     val w = gemm_work_len[T](cols, qr_block, rows - qr_block)
     val c = gemm_work_len[T](rows - qr_block, cols, qr_block)
-    QrWorkLen(qr_block * qr_block + cols * qr_block, GemmWorkLen(max(w.a, c.a), max(w.b, c.b)))
+    val m = trmm_work_len[T](Side.Right, cols, qr_block)
+    QrWorkLen(qr_block * qr_block + cols * qr_block, GemmWorkLen(max(max(w.a, c.a), m.a), max(max(w.b, c.b), m.b)))
 
 /** Whether `work` is at least `need` long in each buffer. */
 private[slapack] fits[T](work: QrWork[T], need: QrWorkLen) -> bool = work.block.len >= need.block && work.gemm.a.len >= need.gemm.a && work.gemm.b.len >= need.gemm.b
@@ -116,25 +118,6 @@ private[slapack] larf[T: Real](tau: T, tail: Strided[T], c: MatrixMut[T], w: []T
     axpy(-tau, wv.as_view(), c.row(0))
     if below > 0 then ger(-tau, tail, wv.as_view(), c.block(1, 0, below, n))
 
-/** B := B A for a `k` x `k` triangular A, of which only the `uplo` triangle is read — and with `Unit`
- * not its diagonal either, which is taken to be ones. BLAS's `trmm` from the right, which sblas does
- * not have; here each column of the product is one `gemv` over the columns of B it combines.
- */
-private trmm_right[T: Real](uplo: Uplo, diag: Diag, a: Matrix[T], b: MatrixMut[T])
-    val (n, k) = (b.rows, b.cols)
-    if n == 0 then return
-    val bv = b.as_view()
-    for step in 0..<k
-        // Column j of the product combines columns left of j (upper) or right of it (lower), so walking
-        // away from them leaves each still unwritten when it is read.
-        val j = if uplo == Uplo.Upper then k - 1 - step else step
-        val d = if diag == Diag.Unit then T.one() else a.at(j, j)
-        val (from, len) = if uplo == Uplo.Upper then (0, j) else (j + 1, k - j - 1)
-        if len > 0
-            gemv(T.one(), bv.block(0, from, n, len), a.block(from, j, len, 1).col(0), d, b.col(j))
-        else if d != T.one()
-            scal(d, b.col(j))
-
 /** LAPACK's `larft`, forward and columnwise: the upper triangular T with H(0) H(1) … H(k−1) =
  * I − V T Vᵀ, for the `k` reflectors in the columns of `v` (read below the diagonal only) and their
  * scales in `tau`. Only T's upper triangle is written.
@@ -167,14 +150,14 @@ private larfb[T: Real](trans: Transpose, v: Matrix[T], t: Matrix[T], c: MatrixMu
     val cv = c.as_view()
     // W := C₁ᵀ V₁ + C₂ᵀ V₂.
     for j in 0..<k do copy(cv.row(j), w.col(j))
-    trmm_right(Uplo.Lower, Diag.Unit, v.block(0, 0, k, k), w)
+    trmm(Side.Right, Uplo.Lower, Diag.Unit, T.one(), v.block(0, 0, k, k), w, work)
     if m > k then gemm(T.one(), cv.block(k, 0, m - k, n).t(), v.block(k, 0, m - k, k), T.one(), w, work)
     // W := W Tᵀ for H, W T for Hᵀ.
-    if trans == Transpose.NoTrans then trmm_right(Uplo.Lower, Diag.NonUnit, t.t(), w) else trmm_right(Uplo.Upper, Diag.NonUnit, t, w)
+    if trans == Transpose.NoTrans then trmm(Side.Right, Uplo.Lower, Diag.NonUnit, T.one(), t.t(), w, work) else trmm(Side.Right, Uplo.Upper, Diag.NonUnit, T.one(), t, w, work)
     // C −= V Wᵀ: C₂ by a gemm, C₁ through W V₁ᵀ.
     val wv = w.as_view()
     if m > k then gemm(-T.one(), v.block(k, 0, m - k, k), wv.t(), T.one(), c.block(k, 0, m - k, n), work)
-    trmm_right(Uplo.Upper, Diag.Unit, v.block(0, 0, k, k).t(), w)
+    trmm(Side.Right, Uplo.Upper, Diag.Unit, T.one(), v.block(0, 0, k, k).t(), w, work)
     for j in 0..<k do axpy(-T.one(), wv.col(j), c.row(j))
 
 /** The unblocked factorisation, LAPACK's `geqr2`, with `w` at least `a.cols` long. */

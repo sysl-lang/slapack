@@ -150,18 +150,15 @@ does not check U's diagonal: the factors of a singular matrix divide by zero.
 default `nb` for `potrf`); an order within one block is factored by `potf2` alone. It is written for
 the lower triangle, and `Upper` runs it on `a.t()`. For each block `j..<j + jb`:
 
-1. the unblocked kernel brings the diagonal block up to date with the `j` columns left of it and
-   factors it, `L₁₁ L₁₁ᵀ = A₁₁ − L₁₀ L₁₀ᵀ`;
+1. one `syrk` brings the diagonal block's lower triangle up to date with the `j` columns left of it,
+   `A₁₁ −= L₁₀ L₁₀ᵀ`, and `potf2` factors it, `L₁₁ L₁₁ᵀ = A₁₁`;
 2. one `gemm` updates the rows below, `A₂₁ −= L₂₀ L₁₀ᵀ`;
 3. `trsm` (right, with `L₁₁ᵀ`, an upper view) finishes them, `L₂₁ = A₂₁ L₁₁⁻ᵀ`.
 
-**The diagonal block's update is the kernel's, not a `syrk`.** LAPACK updates `A₁₁` with `dsyrk` and
-then calls `dpotf2`; sblas has no `syrk`, and a `gemm` there would write the triangle `potrf` may not
-touch. So the unblocked kernel is written left-looking over the whole row of the block: column `c`
-subtracts its row's dot product with itself from the diagonal and a `gemv` of the rows below against
-it, both reaching back past the block to column 0. With no columns to the left that is exactly
-`dpotf2`; inside `potrf` it is `dsyrk` and `dpotf2` fused, at the same flop count (`jb² j` per block,
-small beside the `gemm`). A `syrk` in sblas would let the step be split as LAPACK splits it.
+That is LAPACK's `dpotrf` step for step. sblas's `syrk` reads and writes only the lower triangle of
+`A₁₁`, so the triangle `potrf` may not touch stays untouched, and the packing buffers `potrf_work_len`
+gives cover the widest `syrk` as well as the `gemm` and `trsm` (`syrk` checks its buffers before its
+first block, where `L₁₀` has no columns and it does nothing).
 
 **A diagonal that is not positive stops the factorisation.** As in `dpotf2`, a diagonal that comes to
 zero, a negative value or a NaN is written back in place and `NotPositiveDefinite(j)` answered; the
@@ -193,11 +190,10 @@ slapack's `larf` takes the tail of v and treats the one itself, so A is never wr
 `ormqr` can take its reflectors as a read-only `Matrix`, as it is given them. `larft` and `larfb`
 likewise never read the diagonal of the reflectors' block, which holds R.
 
-**sblas has no `trmm`**, which `dlarfb` calls three times. The products are `k` x `k` triangles
-(`k ≤ 32`) against a `cols` x `k` W, so slapack's private `trmm_right` forms each column of W A with
-one `gemv` over the columns of W it combines, walking away from them so that each is still unwritten
-when read. That is `cols k²` flops beside the `gemm`s' `rows cols k`: small, and the step a `trmm`
-in sblas would take over.
+`dlarfb`'s three triangular products are sblas's `trmm` from the right: W V₁, then W Tᵀ (`H`) or
+W T (`Hᵀ`), then W V₁ᵀ, each a `k` x `k` triangle (`k ≤ 32`) against the `cols` x `k` W, with the unit
+diagonal of V₁ never read. They share `larfb`'s packing buffers, which the `_work_len` functions size
+for the `gemm`s and for a `trmm` of a full block.
 
 **One side, as one triangle in Cholesky.** Every reflection is applied from the left. C Q is (Qᵀ Cᵀ)ᵀ,
 so `ormqr(Side.Right, trans, …, c)` is the left-hand product on `c.t()` with the transpose flipped;
@@ -241,10 +237,10 @@ selection in `steqr`, so that each vector moves at most once.
 updates the trailing matrix with one `dsyr2k`; sblas has no `syr2k`, and for the orders this package
 tests the unblocked form is a few milliseconds. `orgtr` is blocked, since it is `orgqr`.
 
-**sblas has no `symv` or `syr2`**, which `dsytd2` calls once per column. slapack's private
-`symv_lower` reads the lower triangle once, each column below the diagonal as one `axpy` into y and one
-`dot` with x; `syr2_lower` is two `axpy`s per column of the triangle. Neither touches the other
-triangle, so `syev` with `Values` leaves it as it was.
+`dsytd2`'s two calls per column are sblas's `symv` and `syr2` on the lower triangle of A₂₂. `symv`
+runs with a zero β, so it sets w without reading it, and neither touches the other triangle, so
+`syev` with `Values` leaves it as it was. Neither takes a workspace, so `sytrd`'s is still its two
+vectors.
 
 **One triangle, as in Cholesky.** The upper triangle of a symmetric A is the lower triangle of `a.t()`,
 so `Upper` is the lower reduction of the transposed view: the reflectors land right of A's
