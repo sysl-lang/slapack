@@ -1,0 +1,370 @@
+module sh.sysl.slapack
+@tests
+
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, Uplo, matrix, matrix_mut}
+import sysl.buf.{Buf, buf_filled}
+
+// potrf and potrs against their definitions: systems factored and solved by hand, and generated
+// symmetric positive definite ones checked by LAPACK's own measures — the factorisation residual
+// ‖A − L Lᵀ‖ / (n ‖A‖ ε) and the solve residual ‖A X − B‖ / (n ‖A‖ ‖X‖ ε), in the 1-norm and under
+// LAPACK's test threshold of 30. The stream, the norms and the solve residual are tests_lu's.
+// Agreement with the platform's LAPACK is in the oracle's tests.
+
+/** potrf in buffers of the length potrf_work_len gives. */
+private factor_chol[T: Real](uplo: Uplo, a: MatrixMut[T]) -> Result[unit, Error]
+    val len = potrf_work_len[T](a.rows)
+    val pa: Buf[T] = buf_filled(len.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.b, T.zero())
+    potrf(uplo, a, GemmWork(pa.view(), pb.view()))
+
+/** potrs in buffers of the length potrs_work_len gives. */
+private solve_chol[T: Real](uplo: Uplo, f: Matrix[T], b: MatrixMut[T])
+    val len = potrs_work_len[T](f.rows, b.cols)
+    val pa: Buf[T] = buf_filled(len.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.b, T.zero())
+    potrs(uplo, f, b, GemmWork(pa.view(), pb.view()))
+
+/** A random symmetric positive definite matrix of order `n`, column-major with leading dimension `n`:
+ * Bᵀ B + n I for a B of the stream's elements.
+ */
+private spd[T: Real](g: *Stream, n: usize) -> Buf[T]
+    val b = random[T](g, n, n, n, T.zero())
+    val a: Buf[T] = buf_filled(n * n, T.zero())
+    for j in 0..<n
+        for i in 0..<n
+            var s = if i == j then T(n) else T.zero()
+            for p in 0..<n
+                s = s + b[p + i * n] * b[p + j * n]
+            a[i + j * n] = s
+    a
+
+/** Whether `(i, j)` lies in the `uplo` triangle, the diagonal included. */
+private inside(uplo: Uplo, i: usize, j: usize) -> bool = if uplo == Uplo.Lower then i >= j else i <= j
+
+/** `a`'s `uplo` triangle in a fresh order-`n` matrix of leading dimension `ld`, every other element —
+ * the other triangle and the padding rows — a NaN, so that reading or writing one shows.
+ */
+private triangle[T: Real](uplo: Uplo, a: []const T, n: usize, ld: usize) -> Buf[T]
+    val s: Buf[T] = buf_filled(ld * n, T.nan())
+    for j in 0..<n
+        for i in 0..<n
+            if inside(uplo, i, j) then s[i + j * ld] = a[i + j * n]
+    s
+
+/** Element `(i, j)` of the lower factor L, read from the `uplo` triangle of `f`: U is Lᵀ. */
+private lower_at[T: Real](uplo: Uplo, f: Matrix[T], i: usize, j: usize) -> T
+    if i < j then return T.zero()
+    if uplo == Uplo.Lower then f.at(i, j) else f.at(j, i)
+
+/** ‖A − L Lᵀ‖₁ / (n ‖A‖₁ ε), L read from the `uplo` triangle of `f`. */
+private chol_ratio[T: Real](uplo: Uplo, a: Matrix[T], f: Matrix[T]) -> T
+    val n = a.rows
+    val diff = (i: usize, j: usize) ->
+        var s = T.zero()
+        for p in 0..<(if i < j then i else j) + 1
+            s = s + lower_at(uplo, f, i, p) * lower_at(uplo, f, j, p)
+        a.at(i, j) - s
+    val r = norm1(n, n, diff)
+    val norm = norm1(n, n, (i, j) -> a.at(i, j))
+    if norm == T.zero() then r else r / (T(max1(n, n)) * norm * T.epsilon())
+
+/** Factors a random symmetric positive definite matrix of order `n` from its `uplo` triangle alone,
+ * checks the residual and that nothing outside that triangle was touched, then solves three right-hand
+ * sides and checks that residual.
+ */
+private check_spd[T: Real](uplo: Uplo, n: usize, seed: u64)
+    var g = Stream(seed)
+    val a = spd[T](&g, n)
+    val ld = n + 3
+    val s = triangle(uplo, a.view(), n, ld)
+    val f = matrix_mut(s.view(), n, n, ld)
+    assert(factor_chol(uplo, f) == Ok(()), s"a positive definite matrix of order $n was refused")
+    for j in 0..<n
+        for i in 0..<ld
+            if i >= n || !inside(uplo, i, j) then assert(s[i + j * ld].is_nan(), "potrf wrote outside its triangle")
+    val am = matrix(a.view(), n, n, n)
+    val ratio = chol_ratio(uplo, am, f.as_view())
+    assert(ratio < T(threshold), s"‖A − L Lᵀ‖ / (n ‖A‖ ε) = ${f64(ratio)} at order $n")
+    val nrhs: usize = 3
+    val b = random[T](&g, n, nrhs, n, T.zero())
+    val x: Buf[T] = buf_filled(n * nrhs, T.zero())
+    for i in 0..<x.len() do x[i] = b[i]
+    solve_chol(uplo, f.as_view(), matrix_mut(x.view(), n, nrhs, n))
+    val r = solve_ratio(am, matrix(x.view(), n, nrhs, n), matrix(b.view(), n, nrhs, n))
+    assert(r < T(threshold), s"‖A X − B‖ / (n ‖A‖ ‖X‖ ε) = ${f64(r)} at order $n")
+
+private sweep_chol_small[T: Real](seed: u64)
+    for n in 1..64
+        check_spd[T](Uplo.Lower, n, seed + u64(n))
+        check_spd[T](Uplo.Upper, n, seed + u64(n))
+
+@test("potrf and potrs on random positive definite matrices of every order 1 to 64, both triangles: residuals within LAPACK's threshold, f64")
+chol_random_small_f64()
+    sweep_chol_small[f64](1)
+
+@test("potrf and potrs on random positive definite matrices of every order 1 to 64, both triangles: residuals within LAPACK's threshold, f32")
+chol_random_small_f32()
+    sweep_chol_small[f32](1)
+
+/** Orders past the block width: one block and a column more, a block edge, and two and three blocks
+ * with ragged ends.
+ */
+private sweep_chol_blocked[T: Real](seed: u64)
+    val orders: [6]usize = [65, 100, 128, 129, 193, 200]
+    for n in orders
+        check_spd[T](Uplo.Lower, n, seed + u64(n))
+        check_spd[T](Uplo.Upper, n, seed + u64(n))
+
+@test("potrf blocks past the block width, both triangles, with potrs: residuals within LAPACK's threshold, f64")
+chol_random_blocked_f64()
+    sweep_chol_blocked[f64](7)
+
+@test("potrf blocks past the block width, both triangles, with potrs: residuals within LAPACK's threshold, f32")
+chol_random_blocked_f32()
+    sweep_chol_blocked[f32](7)
+
+// --- Hand-checked systems ---------------------------------------------------------------------------
+
+@test("3 x 3 systems factored and solved by hand, from either triangle: the factor and x exactly")
+chol_by_hand()
+    // A = [4 2 2; 2 5 3; 2 3 6] = L Lᵀ with L = [2 0 0; 1 2 0; 1 1 2]. The other triangle holds 99,
+    // which neither routine may read or change.
+    var lo: [9]f64 = [4, 2, 2, 99, 5, 3, 99, 99, 6]
+    assert(potrf(Uplo.Lower, matrix_mut(lo[..], 3, 3, 3), work0()) == Ok(()))
+    val want_lo: [9]f64 = [2, 1, 1, 99, 2, 1, 99, 99, 2]
+    for i in 0..<9
+        assert(lo[i] == want_lo[i], "the lower factor is not the hand-computed one")
+    var up: [9]f64 = [4, 99, 99, 2, 5, 99, 2, 3, 6]
+    assert(potrf(Uplo.Upper, matrix_mut(up[..], 3, 3, 3), work0()) == Ok(()))
+    val want_up: [9]f64 = [2, 99, 99, 1, 2, 99, 1, 1, 2]
+    for i in 0..<9
+        assert(up[i] == want_up[i], "the upper factor is not the hand-computed one")
+    // A x = [8, 10, 11] has x = [1, 1, 1], with either factor.
+    var b: [3]f64 = [8, 10, 11]
+    potrs(Uplo.Lower, matrix(lo[..], 3, 3, 3), matrix_mut(b[..], 3, 1, 3), work0())
+    assert(b[0] == 1 && b[1] == 1 && b[2] == 1)
+    var c: [3]f64 = [8, 10, 11]
+    potrs(Uplo.Upper, matrix(up[..], 3, 3, 3), matrix_mut(c[..], 3, 1, 3), work0())
+    assert(c[0] == 1 && c[1] == 1 && c[2] == 1)
+    // [25 15 -5; 15 18 0; -5 0 11] has L = [5 0 0; 3 3 0; -1 1 3]; two right-hand sides at once:
+    // x = [1, 0, 0] and x = [1, 1, 1].
+    var t: [9]f64 = [25, 15, -5, 0, 18, 0, 0, 0, 11]
+    assert(potf2(Uplo.Lower, matrix_mut(t[..], 3, 3, 3)) == Ok(()))
+    assert(t[0] == 5 && t[1] == 3 && t[2] == -1 && t[4] == 3 && t[5] == 1 && t[8] == 3)
+    var two: [6]f64 = [25, 15, -5, 35, 33, 6]
+    potrs(Uplo.Lower, matrix(t[..], 3, 3, 3), matrix_mut(two[..], 3, 2, 3), work0())
+    val want_x: [6]f64 = [1, 0, 0, 1, 1, 1]
+    for i in 0..<6
+        assert(two[i] == want_x[i])
+
+@test("an order-1 matrix is its own square root, and an order-1 solve divides twice")
+chol_order_one()
+    var s: [1]f32 = [9]
+    var w: [1]f32
+    assert(potrf(Uplo.Upper, matrix_mut(s[..], 1, 1, 1), GemmWork(w[0..<0], w[0..<0])) == Ok(()))
+    assert(s[0] == 3)
+    var b: [1]f32 = [18]
+    potrs(Uplo.Upper, matrix(s[..], 1, 1, 1), matrix_mut(b[..], 1, 1, 1), GemmWork(w[0..<0], w[0..<0]))
+    assert(b[0] == 2)
+
+// --- Matrices that are not positive definite --------------------------------------------------------
+
+@test("a matrix that is not positive definite answers NotPositiveDefinite naming the column, and stops there")
+chol_not_pd_by_hand()
+    // [1 2; 2 1]: L₁₁ = 1, L₂₁ = 2, and the second diagonal comes to 1 - 4 = -3, which is left in place.
+    for uplo in [Uplo.Lower, Uplo.Upper]
+        var s: [4]f64 = [1, 2, 2, 1]
+        assert(potrf(uplo, matrix_mut(s[..], 2, 2, 2), work0()) == Err(Error.NotPositiveDefinite(1)))
+        assert(s[0] == 1 && s[3] == -3)
+        assert(if uplo == Uplo.Lower then s[1] == 2 && s[2] == 2 else s[2] == 2 && s[1] == 2)
+    // A zero, a negative and a NaN first diagonal: column 0, and nothing after it is touched.
+    val firsts: [3]f64 = [0, -4, f64.nan()]
+    for d in firsts
+        var s: [4]f64 = [d, 7, 7, 1]
+        assert(potf2(Uplo.Lower, matrix_mut(s[..], 2, 2, 2)) == Err(Error.NotPositiveDefinite(0)))
+        assert(s[1] == 7 && s[3] == 1)
+    // Positive semidefinite is not enough: [1 1; 1 1] reaches exactly zero.
+    var p: [4]f32 = [1, 1, 1, 1]
+    assert(potf2(Uplo.Upper, matrix_mut(p[..], 2, 2, 2)) == Err(Error.NotPositiveDefinite(1)))
+    assert(p[3] == 0)
+
+/** A random positive definite matrix of order `n` with `A(k, k)` set to zero: every leading minor
+ * before order `k + 1` is untouched and positive definite, and the one of order `k + 1` is not, since
+ * the diagonal comes to `-aᵀ A⁻¹ a` for the column `a` above it. potrf must name `k`, leave the factor
+ * of the columns before it exactly as factoring the unmodified matrix does, and touch nothing outside
+ * its triangle.
+ */
+private check_not_pd[T: Real](uplo: Uplo, n: usize, k: usize, seed: u64)
+    var g = Stream(seed)
+    val a = spd[T](&g, n)
+    val good = triangle(uplo, a.view(), n, n)
+    a[k + k * n] = T.zero()
+    val bad = triangle(uplo, a.view(), n, n)
+    assert(factor_chol(uplo, matrix_mut(good.view(), n, n, n)) == Ok(()))
+    assert(factor_chol(uplo, matrix_mut(bad.view(), n, n, n)) == Err(Error.NotPositiveDefinite(k)), s"the wrong column named at order $n")
+    for j in 0..<k
+        for i in 0..<k
+            val at = i + j * n
+            if inside(uplo, i, j) then assert(bad[at] == good[at], "a column before the failure differs from the full factor")
+    assert(bad[k + k * n] <= T.zero(), "the failing diagonal was not left in place")
+    for j in 0..<n
+        for i in 0..<n
+            if !inside(uplo, i, j) then assert(bad[i + j * n].is_nan(), "potrf wrote outside its triangle")
+
+@test("NotPositiveDefinite names the column in the blocked path: inside the first block, at a block edge, and past it")
+chol_not_pd_blocked()
+    for uplo in [Uplo.Lower, Uplo.Upper]
+        check_not_pd[f64](uplo, 100, 10, 3)
+        check_not_pd[f64](uplo, 100, 63, 4)
+        check_not_pd[f64](uplo, 100, 64, 5)
+        check_not_pd[f64](uplo, 150, 80, 6)
+        check_not_pd[f32](uplo, 130, 129, 7)
+        check_not_pd[f32](uplo, 40, 0, 8)
+
+@test("the NotPositiveDefinite error compares by index and is not Singular")
+chol_not_pd_error()
+    assert(Error.NotPositiveDefinite(3) == Error.NotPositiveDefinite(3))
+    assert(Error.NotPositiveDefinite(3) != Error.NotPositiveDefinite(4))
+    assert(Error.NotPositiveDefinite(3) != Error.Singular(3))
+    if Error.NotPositiveDefinite(3) is NotPositiveDefinite(i)
+        assert(i + 1 == 4)
+
+// --- Upper against Lower ----------------------------------------------------------------------------
+
+/** The two factors are computed over different strides — a row of one is a column of the other — and
+ * sblas's kernels round a contiguous and a strided operand differently, so they agree to rounding, not
+ * bit for bit: within `4 · n · ε` of the largest element.
+ */
+@test("the upper factor is the transpose of the lower one, to rounding, unblocked and blocked")
+chol_upper_is_lower_transposed()
+    val orders: [3]usize = [5, 64, 150]
+    for n in orders
+        var g = Stream(u64(n))
+        val a = spd[f64](&g, n)
+        val lo = triangle(Uplo.Lower, a.view(), n, n)
+        val up = triangle(Uplo.Upper, a.view(), n, n)
+        assert(factor_chol(Uplo.Lower, matrix_mut(lo.view(), n, n, n)) == Ok(()))
+        assert(factor_chol(Uplo.Upper, matrix_mut(up.view(), n, n, n)) == Ok(()))
+        var most: f64 = 0
+        for j in 0..<n
+            for i in j..<n
+                if lo[i + j * n].abs() > most then most = lo[i + j * n].abs()
+        val tol = f64(4 * n) * f64.epsilon() * most
+        for j in 0..<n
+            for i in j..<n
+                assert((lo[i + j * n] - up[j + i * n]).abs() <= tol, s"L($i, $j) and U($j, $i) differ at order $n")
+
+// --- Empty input ------------------------------------------------------------------------------------
+
+@test("an empty matrix factors to Ok and an empty solve touches nothing")
+chol_empty()
+    var s: [4]f64 = [9, 9, 9, 9]
+    assert(potrf(Uplo.Lower, matrix_mut(s[0..<0], 0, 0, 1), work0()) == Ok(()))
+    assert(potrf(Uplo.Upper, matrix_mut(s[0..<0], 0, 0, 1), work0()) == Ok(()))
+    assert(potf2(Uplo.Lower, matrix_mut(s[0..<0], 0, 0, 1)) == Ok(()))
+    potrs(Uplo.Lower, matrix(s[0..<0], 0, 0, 1), matrix_mut(s[0..<0], 0, 3, 1), work0())
+    var f: [4]f64 = [2, 1, 1, 2]
+    potrs(Uplo.Upper, matrix(f[..], 2, 2, 2), matrix_mut(s[..], 2, 0, 2), work0())
+    for v in s
+        assert(v == 9)
+    val len = potrf_work_len[f64](0)
+    assert(len.a == 0 && len.b == 0)
+
+// --- Views as input ---------------------------------------------------------------------------------
+
+@test("potrf and potrs on blocks of a larger matrix leave everything outside the blocks alone")
+chol_submatrix_views()
+    // A 3 x 3 block at (2, 1) of a 7 x 6 matrix of NaN, holding the lower triangle of the system above.
+    val ld: usize = 7
+    var s: [42]f64
+    for i in 0..<42 do s[i] = f64.nan()
+    val big = matrix_mut(s[..], 7, 6, ld)
+    val a = big.block(2, 1, 3, 3)
+    val vals: [9]f64 = [4, 2, 2, 2, 5, 3, 2, 3, 6]
+    for j in 0..<3
+        for i in j..<3
+            a.set(i, j, vals[i + 3 * j])
+    assert(potrf(Uplo.Lower, a, work0()) == Ok(()))
+    assert(a.at(0, 0) == 2 && a.at(2, 1) == 1 && a.at(2, 2) == 2)
+    for j in 0..<6
+        for i in 0..<7
+            if !(i >= 2 && i < 5 && j >= 1 && j < 4 && i - 2 >= j - 1) then assert(s[i + ld * j].is_nan(), "potrf wrote outside its triangle")
+    // The right-hand side is column 5 of the same storage, rows 2 to 4.
+    val b = big.block(2, 5, 3, 1)
+    b.set(0, 0, 8)
+    b.set(1, 0, 10)
+    b.set(2, 0, 11)
+    potrs(Uplo.Lower, a.as_view(), b, work0())
+    assert(b.at(0, 0) == 1 && b.at(1, 0) == 1 && b.at(2, 0) == 1)
+    assert(s[1 + ld * 5].is_nan() && s[5 + ld * 5].is_nan(), "potrs wrote outside its block")
+
+@test("potrf on a row-major view, the transpose of column-major storage, factors the same matrix")
+chol_row_major_view()
+    // Lower of the view through t() is the upper triangle of the storage.
+    var s: [9]f64 = [4, 99, 99, 2, 5, 99, 2, 3, 6]
+    val a = matrix_mut(s[..], 3, 3, 3).t()
+    assert(potrf(Uplo.Lower, a, work0()) == Ok(()))
+    assert(a.at(0, 0) == 2 && a.at(1, 0) == 1 && a.at(2, 0) == 1 && a.at(1, 1) == 2 && a.at(2, 1) == 1 && a.at(2, 2) == 2)
+    assert(s[1] == 99 && s[2] == 99 && s[5] == 99)
+
+@test("a blocked factorisation of a block of a larger matrix agrees bit for bit with the same matrix on its own")
+chol_blocked_block_view()
+    val n: usize = 140
+    var g = Stream(11)
+    val alone = spd[f64](&g, n)
+    val ld: usize = 170
+    val big: Buf[f64] = buf_filled(ld * (n + 5), f64.nan())
+    for j in 0..<n
+        for i in j..<n
+            big[(i + 20) + (j + 5) * ld] = alone[i + j * n]
+    assert(factor_chol(Uplo.Lower, matrix_mut(alone.view(), n, n, n)) == Ok(()))
+    assert(factor_chol(Uplo.Lower, matrix_mut(big.view(), ld, n + 5, ld).block(20, 5, n, n)) == Ok(()))
+    for j in 0..<n
+        for i in j..<n
+            assert(alone[i + j * n] == big[(i + 20) + (j + 5) * ld])
+    for i in 0..<20
+        assert(big[i + 5 * ld].is_nan())
+
+// --- The workspace, and what traps ----------------------------------------------------------------
+
+@test("potrf's workspace is nothing within a block and enough for every update past it")
+chol_work_len()
+    val small = potrf_work_len[f64](64)
+    assert(small.a == 0 && small.b == 0)
+    val n: usize = 200
+    val len = potrf_work_len[f64](n)
+    assert(len.a > 0 && len.b > 0)
+    // potrf runs in buffers of exactly that length.
+    var g = Stream(2)
+    val s = spd[f64](&g, n)
+    val pa: Buf[f64] = buf_filled(len.a, 0)
+    val pb: Buf[f64] = buf_filled(len.b, 0)
+    assert(potrf(Uplo.Upper, matrix_mut(s.view(), n, n, n), GemmWork(pa.view(), pb.view())) == Ok(()))
+
+@test("potrf traps on a matrix that is not square", should_trap)
+chol_not_square()
+    var s: [6]f64 = [1, 0, 0, 0, 1, 0]
+    _ = potrf(Uplo.Lower, matrix_mut(s[..], 3, 2, 3), work0())
+
+@test("potf2 traps on a matrix that is not square", should_trap)
+chol_potf2_not_square()
+    var s: [6]f64 = [1, 0, 0, 1, 0, 0]
+    _ = potf2(Uplo.Upper, matrix_mut(s[..], 2, 3, 2))
+
+@test("potrf traps on packing buffers shorter than potrf_work_len says", should_trap)
+chol_short_work()
+    var g = Stream(2)
+    val s = spd[f64](&g, 100)
+    _ = potrf(Uplo.Lower, matrix_mut(s.view(), 100, 100, 100), work0())
+
+@test("potrs traps on a factor that is not square", should_trap)
+chol_potrs_not_square()
+    var s: [6]f64 = [1, 0, 0, 1, 0, 0]
+    var b: [2]f64
+    potrs(Uplo.Lower, matrix(s[..], 2, 3, 2), matrix_mut(b[..], 2, 1, 2), work0())
+
+@test("potrs traps on a B whose rows are not the matrix's order", should_trap)
+chol_potrs_b_rows()
+    var s: [4]f64 = [1, 0, 0, 1]
+    var b: [3]f64
+    potrs(Uplo.Upper, matrix(s[..], 2, 2, 2), matrix_mut(b[..], 3, 1, 3), work0())

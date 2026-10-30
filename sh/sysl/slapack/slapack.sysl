@@ -17,6 +17,12 @@ enum Error derives Eq
      * them would divide by zero.
      */
     Singular(index: usize)
+    /** The leading minor of order `index + 1` is not positive definite (0-based; LAPACK's `info` is
+     * `index + 1`): the diagonal of the factor came to zero, a negative value or a NaN at `index`. The
+     * factorisation has stopped there: the columns before `index` hold the factor, and `(index, index)`
+     * the value that was not positive.
+     */
+    NotPositiveDefinite(index: usize)
 
 /** Whether a solve is with the matrix itself or with its transpose. */
 enum Transpose

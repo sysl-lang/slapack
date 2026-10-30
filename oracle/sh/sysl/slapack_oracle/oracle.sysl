@@ -1,14 +1,15 @@
 module sh.sysl.slapack_oracle
 
 import sh.sysl.blas.MatrixView
-import sh.sysl.lapack.{Scalar, lu_inplace}
-import sh.sysl.sblas.{Real, matrix_mut}
-import sh.sysl.slapack.heap.getrf_alloc
+import sh.sysl.lapack.{Scalar, lu_inplace, chol_inplace}
+import sh.sysl.sblas.{Real, Uplo, matrix_mut}
+import sh.sysl.slapack.heap.{getrf_alloc, potrf_alloc}
 import sysl.buf.{Buf, buf_filled}
 import sysl.math.min
 
-// slapack's getrf beside the platform's (Accelerate on macOS, OpenBLAS elsewhere), on the same matrix:
-// the same pivots, the same zero pivot, and factors that agree to within rounding.
+// slapack's getrf and potrf beside the platform's (Accelerate on macOS, OpenBLAS elsewhere), on the
+// same matrix: the same pivots, the same zero pivot or failing minor, and factors that agree to within
+// rounding.
 
 /** What one factorisation answered: the factors, the pivots 0-based, and the first zero pivot. */
 struct Factored[T]
@@ -24,6 +25,7 @@ slapack_lu[T: Real](a: []const T, m: usize, n: usize) -> Factored[T]
     val zero = getrf_alloc(matrix_mut(f.view(), m, n, if m == 0 then 1 else m), ipiv.view()) match
         Ok(_) -> None
         Err(Singular(j)) -> Some(j)
+        Err(NotPositiveDefinite(_)) -> panic("getrf answered a Cholesky error")
     Factored(f, ipiv, zero)
 
 /** The platform's getrf of the same matrix, its 1-based pivots and `info` brought to slapack's terms. */
@@ -35,3 +37,27 @@ platform_lu[T: Real + Scalar](a: []const T, m: usize, n: usize) -> Factored[T]
     val ipiv: Buf[usize] = buf_filled(p.len(), 0)
     for i in 0..<p.len() do ipiv[i] = usize(p[i] - 1)
     Factored(f, ipiv, if info > 0 then Some(usize(info - 1)) else None)
+
+/** What one Cholesky factorisation answered: the matrix it was left holding, and the first column whose
+ * leading minor was not positive definite.
+ */
+struct Cholesky[T]
+    factor: Buf[T]
+    failed: Option[usize]
+
+/** slapack's potrf of the order-`n` column-major matrix in `a`, from its `uplo` triangle. */
+slapack_chol[T: Real](uplo: Uplo, a: []const T, n: usize) -> Cholesky[T]
+    val f: Buf[T] = buf_filled(a.len, T.zero())
+    for i in 0..<a.len do f[i] = a[i]
+    val failed = potrf_alloc(uplo, matrix_mut(f.view(), n, n, if n == 0 then 1 else n)) match
+        Ok(_) -> None
+        Err(NotPositiveDefinite(j)) -> Some(j)
+        Err(Singular(_)) -> panic("potrf answered an LU error")
+    Cholesky(f, failed)
+
+/** The platform's potrf of the same matrix, its `info` brought to slapack's terms. */
+platform_chol[T: Real + Scalar](uplo: Uplo, a: []const T, n: usize) -> Cholesky[T]
+    val f: Buf[T] = buf_filled(a.len, T.zero())
+    for i in 0..<a.len do f[i] = a[i]
+    val info = chol_inplace(MatrixView.of(f.view(), n, n).unwrap(), uplo == Uplo.Upper).unwrap()
+    Cholesky(f, if info > 0 then Some(usize(info - 1)) else None)

@@ -8,7 +8,7 @@
 //
 // The coordinate names the package, `slapack`; the module a program imports is `sh.sysl.slapack`.
 
-package { name = "slapack", version = "0.1.0", sysl = "0.8.2" }
+package { name = "slapack", version = "0.1.0", sysl = "0.8.3" }
 optimization = "2"
 
 // `oracle` checks the factorisations against the platform's LAPACK through the `lapack` binding, in a

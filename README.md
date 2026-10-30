@@ -15,7 +15,7 @@ trademark holders.*
 | family | routines | state |
 |---|---|---|
 | LU | `getrf`, `getrs` (and `getf2`, `laswp`) | done, f32 and f64 |
-| Cholesky | `potrf`, `potrs` | planned |
+| Cholesky | `potrf`, `potrs` (and `potf2`) | done, f32 and f64 |
 | QR | `geqrf`, `orgqr` | planned |
 | symmetric eigenproblem | `syev` | planned |
 | singular value decomposition | `gesvd` | planned |
@@ -52,13 +52,31 @@ var p: [2]usize
 print(getrf_alloc(matrix_mut(s[..], 2, 2, 2), p[..]) == Err(Error.Singular(1)))   // true: U(1, 1) = 0
 ```
 
-`getrf` and `getrs` themselves take sblas's `GemmWork` packing buffers, sized by `getrf_work_len` and
-`getrs_work_len`, and allocate nothing; `sh.sysl.slapack.heap` holds the forms that allocate them per
-call. The design, and what the language made easy or hard, is in [DESIGN.md](DESIGN.md).
+A symmetric positive definite system is factored from one triangle, named by sblas's `Uplo`, and the
+other triangle is never read or written:
+
+```sysl
+import sh.sysl.sblas.{Uplo, matrix, matrix_mut}
+import sh.sysl.slapack.Error
+import sh.sysl.slapack.heap.{potrf_alloc, potrs_alloc}
+
+var a: [9]f64 = [4, 2, 2, 0, 5, 3, 0, 0, 6]           // the lower triangle of [4 2 2; 2 5 3; 2 3 6]
+var b: [3]f64 = [8, 10, 11]
+print(potrf_alloc(Uplo.Lower, matrix_mut(a[..], 3, 3, 3)))                     // Ok(()): A = L Lᵀ
+potrs_alloc(Uplo.Lower, matrix(a[..], 3, 3, 3), matrix_mut(b[..], 3, 1, 3))
+print(b)                                                                       // [1, 1, 1]
+
+var c: [4]f64 = [1, 2, 2, 1]                           // [1 2; 2 1] is indefinite
+print(potrf_alloc(Uplo.Upper, matrix_mut(c[..], 2, 2, 2)) == Err(Error.NotPositiveDefinite(1)))  // true
+```
+
+The routines themselves take sblas's `GemmWork` packing buffers, sized by `getrf_work_len`,
+`getrs_work_len`, `potrf_work_len` and `potrs_work_len`, and allocate nothing; `sh.sysl.slapack.heap`
+holds the forms that allocate them per call. The design, and what the language made easy or hard, is in [DESIGN.md](DESIGN.md).
 
 ## Tests
 
 `sysl test .` runs the package's tests against the routines' definitions — hand-factored systems, and
 LAPACK's own residual measures on random matrices of every order from 1 to 64 and past the panel width,
-square, tall and wide — and `oracle/` compares the factors and pivots with the platform's `dgetrf` and
-`sgetrf` through the `lapack` binding.
+square, tall and wide, and symmetric positive definite from either triangle — and `oracle/` compares the
+factors with the platform's `dgetrf`, `sgetrf`, `dpotrf` and `spotrf` through the `lapack` binding.

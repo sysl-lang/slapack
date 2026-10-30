@@ -27,7 +27,7 @@ private solve[T: Real](trans: Transpose, lu: Matrix[T], ipiv: []const usize, b: 
 // of 30. Agreement with the platform's LAPACK is in the oracle's tests.
 
 /** A deterministic stream of matrix elements in [-1, 1], from a 64-bit xorshift. */
-private struct Stream
+private[slapack] struct Stream
     state: u64
 
 impl Stream
@@ -40,7 +40,7 @@ impl Stream
 /** A fresh column-major `m` x `n` matrix of the stream's elements, in a leading dimension of `ld`, the
  * padding rows holding `pad`.
  */
-private random[T: Real](g: *Stream, m: usize, n: usize, ld: usize, pad: T) -> Buf[T]
+private[slapack] random[T: Real](g: *Stream, m: usize, n: usize, ld: usize, pad: T) -> Buf[T]
     val s: Buf[T] = buf_filled(ld * n, pad)
     for j in 0..<n
         for i in 0..<m
@@ -48,7 +48,7 @@ private random[T: Real](g: *Stream, m: usize, n: usize, ld: usize, pad: T) -> Bu
     s
 
 /** The 1-norm: the largest column sum of magnitudes. */
-private norm1[T: Real](rows: usize, cols: usize, at: (usize, usize) -> T) -> T
+private[slapack] norm1[T: Real](rows: usize, cols: usize, at: (usize, usize) -> T) -> T
     var most = T.zero()
     for j in 0..<cols
         var sum = T.zero()
@@ -80,10 +80,10 @@ private factor_ratio[T: Real](a: Matrix[T], f: Matrix[T], ipiv: []const usize) -
     val r = norm1(m, n, diff)
     if norm == T.zero() then r else r / (T(max1(m, n)) * norm * T.epsilon())
 
-private max1(m: usize, n: usize) -> usize = if m > n then m else if n > 0 then n else 1
+private[slapack] max1(m: usize, n: usize) -> usize = if m > n then m else if n > 0 then n else 1
 
 /** ‖op(A) X − B‖₁ / (n ‖A‖₁ ‖X‖₁ ε). */
-private solve_ratio[T: Real](a: Matrix[T], x: Matrix[T], b: Matrix[T]) -> T
+private[slapack] solve_ratio[T: Real](a: Matrix[T], x: Matrix[T], b: Matrix[T]) -> T
     val n = a.rows
     val diff = (i: usize, j: usize) ->
         var s = T.zero()
@@ -94,7 +94,7 @@ private solve_ratio[T: Real](a: Matrix[T], x: Matrix[T], b: Matrix[T]) -> T
     val scale = T(max1(n, n)) * norm1(n, n, (i, j) -> a.at(i, j)) * norm1(n, x.cols, (i, j) -> x.at(i, j)) * T.epsilon()
     if scale == T.zero() then r else r / scale
 
-private val threshold = 30
+private[slapack] val threshold = 30
 
 /** Factors a random `m` x `n` matrix with padding rows, checks the factorisation residual and that the
  * padding was not touched, and — when square — solves three right-hand sides both ways and checks those
@@ -167,7 +167,7 @@ lu_random_nonsquare()
 
 // --- Hand-checked systems ---------------------------------------------------------------------------
 
-private work0() -> GemmWork[f64]
+private[slapack] work0() -> GemmWork[f64]
     var w: [1]f64
     GemmWork(w[0..<0], w[0..<0])
 

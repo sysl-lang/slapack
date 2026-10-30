@@ -1,7 +1,7 @@
 module sh.sysl.slapack.heap
 @tests
 
-import sh.sysl.sblas.{matrix, matrix_mut}
+import sh.sysl.sblas.{Uplo, matrix, matrix_mut}
 import sh.sysl.slapack.{Error, Transpose}
 import sysl.buf.{Buf, buf_filled}
 
@@ -35,6 +35,32 @@ heap_lu_singular()
     var s: [4]f32 = [1, 2, 2, 4]
     var ipiv: [2]usize
     assert(getrf_alloc(matrix_mut(s[..], 2, 2, 2), ipiv[..]) == Err(Error.Singular(1)))
+
+@test("potrf_alloc and potrs_alloc factor and solve a matrix past a block, from either triangle")
+heap_chol_blocked()
+    val n: usize = 100
+    // A diagonally dominant symmetric matrix, positive definite, with a known solution of all ones.
+    for uplo in [Uplo.Lower, Uplo.Upper]
+        val s: Buf[f64] = buf_filled(n * n, 0)
+        val b: Buf[f64] = buf_filled(n, 0)
+        for j in 0..<n
+            for i in 0..<n
+                val v = if i == j then f64(6 * n) else f64((i * 7 + j * 7) % 11) - 5
+                s[i + j * n] = v
+                b[i] += v
+        assert(potrf_alloc(uplo, matrix_mut(s.view(), n, n, n)) == Ok(()))
+        potrs_alloc(uplo, matrix(s.view(), n, n, n), matrix_mut(b.view(), n, 1, n))
+        for i in 0..<n
+            assert((b[i] - 1).abs() < 1e-12)
+
+@test("potrf_alloc passes NotPositiveDefinite through, and on empty input needs nothing")
+heap_chol_not_pd()
+    var s: [4]f32 = [1, 2, 2, 1]
+    assert(potrf_alloc(Uplo.Lower, matrix_mut(s[..], 2, 2, 2)) == Err(Error.NotPositiveDefinite(1)))
+    var e: [1]f64 = [9]
+    assert(potrf_alloc(Uplo.Upper, matrix_mut(e[0..<0], 0, 0, 1)) == Ok(()))
+    potrs_alloc(Uplo.Upper, matrix(e[0..<0], 0, 0, 1), matrix_mut(e[0..<0], 0, 2, 1))
+    assert(e[0] == 9)
 
 @test("getrf_alloc and getrs_alloc on empty input need nothing and do nothing")
 heap_lu_empty()

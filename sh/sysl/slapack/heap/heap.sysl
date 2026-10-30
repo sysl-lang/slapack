@@ -1,7 +1,7 @@
 module sh.sysl.slapack.heap
 
-import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork}
-import sh.sysl.slapack.{Error, Transpose, getrf, getrf_work_len, getrs, getrs_work_len}
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, Uplo}
+import sh.sysl.slapack.{Error, Transpose, getrf, getrf_work_len, getrs, getrs_work_len, potrf, potrf_work_len, potrs, potrs_work_len}
 import sysl.buf.{Buf, buf_filled}
 
 // The routines of sh.sysl.slapack that need scratch storage, in the form that allocates it per call.
@@ -21,3 +21,17 @@ getrs_alloc[T: Real](trans: Transpose, lu: Matrix[T], ipiv: []const usize, b: Ma
     val pa: Buf[T] = buf_filled(len.a, T.zero())
     val pb: Buf[T] = buf_filled(len.b, T.zero())
     getrs(trans, lu, ipiv, b, GemmWork(pa.view(), pb.view()))
+
+/** `potrf`, with its packing buffers allocated for the call and freed after it. */
+potrf_alloc[T: Real](uplo: Uplo, a: MatrixMut[T]) -> Result[unit, Error]
+    val len = potrf_work_len[T](a.rows)
+    val pa: Buf[T] = buf_filled(len.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.b, T.zero())
+    potrf(uplo, a, GemmWork(pa.view(), pb.view()))
+
+/** `potrs`, with its packing buffers allocated for the call and freed after it. */
+potrs_alloc[T: Real](uplo: Uplo, f: Matrix[T], b: MatrixMut[T])
+    val len = potrs_work_len[T](f.rows, b.cols)
+    val pa: Buf[T] = buf_filled(len.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.b, T.zero())
+    potrs(uplo, f, b, GemmWork(pa.view(), pb.view()))

@@ -1,0 +1,119 @@
+module sh.sysl.slapack
+@no_alloc
+
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, GemmWorkLen, Side, Uplo, Diag, gemm, gemm_work_len, trsm, trsm_work_len, gemv, dot, scal}
+import sysl.math.{min, max}
+
+// The Cholesky factorisation of a symmetric positive definite matrix, A = L Lᵀ or A = Uᵀ U, and the
+// solve with its factor.
+//
+// Only one triangle of A is read and written; the other is never touched. The upper factor of A is the
+// transpose of its lower factor, and the upper triangle of A is the lower triangle of the view `a.t()`,
+// so `Upper` is the lower factorisation of the transposed view: the algorithm is written once.
+//
+// `potrf` is LAPACK's left-looking blocked algorithm. Each step brings a block of `chol_block` columns up
+// to date with every column left of it — its diagonal block in the unblocked kernel, its rows below by
+// one `gemm` — and then finishes the rows below with a `trsm` against the block's own factor.
+
+/** The width of the block `potrf` factors unblocked: LAPACK's default block size for `potrf`. */
+private[slapack] const chol_block: usize = 64
+
+/** The lower factor of an `r` x `r` diagonal block whose rows are those of `a` and whose columns start
+ * at column `k` of it, left-looking: the first `k` columns of `a` are those rows of the factor already
+ * computed, and each column of the block subtracts their contribution before it is scaled. With `k`
+ * zero this is LAPACK's `potf2`. Answers the first column of the block whose diagonal came out not
+ * positive, which is left holding that value; the columns right of it are not touched.
+ */
+private unblocked[T: Real](a: MatrixMut[T], k: usize) -> Option[usize]
+    val r = a.rows
+    for c in 0..<r
+        val col = k + c
+        val done = a.as_view().block(c, 0, 1, col).row(0)
+        val ajj = a.at(c, col) - dot(done, done)
+        if ajj <= T.zero() || ajj.is_nan()
+            a.set(c, col, ajj)
+            return Some(c)
+        val d = ajj.sqrt()
+        a.set(c, col, d)
+        if c + 1 < r
+            // The column below the diagonal: subtract the rows' dot products with this row, then scale.
+            val below = a.block(c + 1, col, r - c - 1, 1).col(0)
+            gemv(-T.one(), a.as_view().block(c + 1, 0, r - c - 1, col), done, T.one(), below)
+            scal(T.one() / d, below)
+    None
+
+/** The view of `a` whose lower triangle holds the triangle `uplo` names. */
+private lower_of[T](uplo: Uplo, a: MatrixMut[T]) -> MatrixMut[T] = if uplo == Uplo.Upper then a.t() else a
+
+/** LAPACK's `potf2`: the Cholesky factorisation of a symmetric positive definite A, unblocked.
+ *
+ * Reads and writes only the `uplo` triangle of `a`, which on return holds L (`Lower`, A = L Lᵀ) or U
+ * (`Upper`, A = Uᵀ U). Answers `NotPositiveDefinite(j)` for the first `j` whose leading minor of order
+ * `j + 1` is not positive definite: the factorisation stops there, columns before `j` holding the factor
+ * and `(j, j)` the non-positive value its diagonal came to. Traps if `a` is not square.
+ */
+potf2[T: Real](uplo: Uplo, a: MatrixMut[T]) -> Result[unit, Error]
+    assert(a.rows == a.cols, "potf2 factors a square matrix")
+    if unblocked(lower_of(uplo, a), 0) is Some(j) then return Err(Error.NotPositiveDefinite(j))
+    Ok(())
+
+/** How many elements each of the two `GemmWork` buffers `potrf` takes needs, for an order-`n` A. A
+ * matrix of `chol_block` or fewer is factored unblocked and needs none.
+ */
+potrf_work_len[T: Real](n: usize) -> GemmWorkLen
+    if n <= chol_block then return GemmWorkLen(0, 0)
+    // No update is taller than the rows below the first block or reaches back further than that.
+    val rest = n - chol_block
+    val solve = trsm_work_len[T](Side.Right, rest, chol_block)
+    val update = gemm_work_len[T](rest, chol_block, rest)
+    GemmWorkLen(max(solve.a, update.a), max(solve.b, update.b))
+
+/** LAPACK's `potrf`: the Cholesky factorisation of a symmetric positive definite A, blocked.
+ *
+ * The result is `potf2`'s — only the `uplo` triangle of `a` read and written, holding L with A = L Lᵀ
+ * or U with A = Uᵀ U — computed a block of columns at a time. `work` holds the packing buffers of the
+ * `gemm` and `trsm` calls, at least `potrf_work_len` long each. Answers `NotPositiveDefinite(j)` for
+ * the first `j` whose leading minor of order `j + 1` is not positive definite (LAPACK's `info` is
+ * `j + 1`); the factorisation stops there, as LAPACK's does. Traps if `a` is not square or `work` is
+ * short.
+ */
+potrf[T: Real](uplo: Uplo, a: MatrixMut[T], work: GemmWork[T]) -> Result[unit, Error]
+    assert(a.rows == a.cols, "potrf factors a square matrix")
+    val n = a.rows
+    if n <= chol_block then return potf2(uplo, a)
+    val need = potrf_work_len[T](n)
+    assert(work.a.len >= need.a && work.b.len >= need.b, "potrf's packing buffers are shorter than potrf_work_len says")
+    val l = lower_of(uplo, a)
+    for var j = 0; j < n; j += chol_block
+        val jb = min(n - j, chol_block)
+        // The diagonal block, brought up to date with the columns left of it and factored.
+        if unblocked(l.block(j, 0, jb, j + jb), j) is Some(c) then return Err(Error.NotPositiveDefinite(j + c))
+        if j + jb < n
+            val below = n - j - jb
+            val l21 = l.block(j + jb, j, below, jb)
+            // A₂₁ -= L₂₀ L₁₀ᵀ, then L₂₁ = A₂₁ L₁₁⁻ᵀ.
+            val done = l.as_view()
+            gemm(-T.one(), done.block(j + jb, 0, below, j), done.block(j, 0, jb, j).t(), T.one(), l21, work)
+            trsm(Side.Right, Uplo.Upper, Diag.NonUnit, T.one(), done.block(j, j, jb, jb).t(), l21, work)
+    Ok(())
+
+/** How many elements each of the two `GemmWork` buffers `potrs` takes needs, for an order-`n` A and
+ * `nrhs` right-hand sides.
+ */
+potrs_work_len[T: Real](n: usize, nrhs: usize) -> GemmWorkLen = trsm_work_len[T](Side.Left, n, nrhs)
+
+/** LAPACK's `potrs`: solves `A X = B` in place in `b`, with the factor `potrf` wrote for A in its
+ * `uplo` triangle of `f`.
+ *
+ * Only that triangle of `f` is read. As in LAPACK the factor is not checked: a zero on its diagonal
+ * divides. `work` holds `trsm`'s packing buffers, at least `potrs_work_len` long each. Traps if `f` is
+ * not square or `b`'s rows are not its order.
+ */
+potrs[T: Real](uplo: Uplo, f: Matrix[T], b: MatrixMut[T], work: GemmWork[T])
+    assert(f.rows == f.cols, "potrs takes the factor of a square matrix")
+    assert(b.rows == f.rows, "B's rows are not the matrix's order")
+    if f.rows == 0 || b.cols == 0 then return
+    val l = if uplo == Uplo.Upper then f.t() else f
+    // L Y = B, then Lᵀ X = Y.
+    trsm(Side.Left, Uplo.Lower, Diag.NonUnit, T.one(), l, b, work)
+    trsm(Side.Left, Uplo.Upper, Diag.NonUnit, T.one(), l.t(), b, work)

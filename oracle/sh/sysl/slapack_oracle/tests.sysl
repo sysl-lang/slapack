@@ -2,7 +2,7 @@ module sh.sysl.slapack_oracle
 @tests
 
 import sh.sysl.lapack.Scalar
-import sh.sysl.sblas.Real
+import sh.sysl.sblas.{Real, Uplo}
 import sysl.buf.{Buf, buf_filled}
 
 /** A deterministic stream of matrix elements in [-1, 1], from a 64-bit xorshift. */
@@ -63,3 +63,67 @@ oracle_getrf_singular()
     agree[f64](120, 120, two[..], 2)
     val last: [1]usize = [99]
     agree[f32](100, 100, last[..], 3)
+
+/** Factors one random symmetric positive definite matrix of order `n` (Bᵀ B + n I) both ways from its
+ * `uplo` triangle, with `A(k, k)` zeroed for a `bad` k so that the minor of order `k + 1` is not
+ * positive definite. The two must name the same failing column; on success every element of the
+ * factor agrees within `64 · n · ε` of the largest, and slapack's did not touch the other triangle.
+ */
+private agree_chol[T: Real + Scalar](uplo: Uplo, n: usize, bad: Option[usize], seed: u64)
+    var g = Stream(seed)
+    val b: Buf[T] = buf_filled(n * n, T.zero())
+    for i in 0..<b.len() do b[i] = g.next[T]()
+    val a: Buf[T] = buf_filled(n * n, T.zero())
+    val other = T(7)
+    for j in 0..<n
+        for i in 0..<n
+            val inside = if uplo == Uplo.Lower then i >= j else i <= j
+            var s = if i == j then T(n) else T.zero()
+            for p in 0..<n
+                s = s + b[p + i * n] * b[p + j * n]
+            a[i + j * n] = if inside then s else other
+    if bad is Some(k) then a[k + k * n] = T.zero()
+    val mine = slapack_chol(uplo, a.view(), n)
+    val theirs = platform_chol(uplo, a.view(), n)
+    assert(mine.failed == theirs.failed, s"the failing column differs at order $n")
+    assert(mine.failed == bad, s"the failing column is not the zeroed diagonal at order $n")
+    if bad.is_some() then return
+    var most = T.zero()
+    for i in 0..<a.len()
+        if theirs.factor[i].abs() > most then most = theirs.factor[i].abs()
+    val tol = T(64 * n) * T.epsilon() * most
+    for j in 0..<n
+        for i in 0..<n
+            val at = i + j * n
+            if (if uplo == Uplo.Lower then i < j else i > j)
+                // Only slapack's is held to this: Accelerate's potrf writes the other triangle from order
+                // 33 on, though LAPACK documents it as not referenced.
+                assert(mine.factor[at] == other, s"potrf wrote the other triangle at ($i, $j), order $n")
+            else
+                val d = (mine.factor[at] - theirs.factor[at]).abs()
+                assert(d <= tol, s"factor element ($i, $j) differs by ${f64(d)} at order $n")
+
+private sweep_chol[T: Real + Scalar]()
+    for uplo in [Uplo.Lower, Uplo.Upper]
+        for n in 1..64
+            agree_chol[T](uplo, n, None, u64(n))
+        val orders: [5]usize = [65, 100, 128, 129, 200]
+        for n in orders
+            agree_chol[T](uplo, n, None, u64(n * 1000))
+
+@test("potrf agrees with the platform's dpotrf from either triangle: orders 1 to 64 and blocked")
+oracle_potrf_f64()
+    sweep_chol[f64]()
+
+@test("potrf agrees with the platform's spotrf from either triangle: orders 1 to 64 and blocked")
+oracle_potrf_f32()
+    sweep_chol[f32]()
+
+@test("potrf names the same failing minor as the platform's, within a block and past one")
+oracle_potrf_not_pd()
+    for uplo in [Uplo.Lower, Uplo.Upper]
+        agree_chol[f64](uplo, 40, Some(5), 1)
+        agree_chol[f64](uplo, 40, Some(0), 2)
+        agree_chol[f64](uplo, 150, Some(64), 3)
+        agree_chol[f64](uplo, 150, Some(120), 4)
+        agree_chol[f32](uplo, 100, Some(99), 5)
