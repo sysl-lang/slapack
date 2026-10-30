@@ -16,7 +16,7 @@ trademark holders.*
 |---|---|---|
 | LU | `getrf`, `getrs` (and `getf2`, `laswp`) | done, f32 and f64 |
 | Cholesky | `potrf`, `potrs` (and `potf2`) | done, f32 and f64 |
-| QR | `geqrf`, `orgqr` | planned |
+| QR | `geqrf`, `orgqr`, `ormqr` (and `geqr2`, `org2r`, `larfg`) | done, f32 and f64 |
 | symmetric eigenproblem | `syev` | planned |
 | singular value decomposition | `gesvd` | planned |
 
@@ -70,13 +70,36 @@ var c: [4]f64 = [1, 2, 2, 1]                           // [1 2; 2 1] is indefini
 print(potrf_alloc(Uplo.Upper, matrix_mut(c[..], 2, 2, 2)) == Err(Error.NotPositiveDefinite(1)))  // true
 ```
 
+The QR factorisation leaves R above A's diagonal and Householder reflectors below it, which `ormqr`
+applies (as Q, Qᵀ, from either side) and `orgqr` turns into Q itself. A least-squares fit is `geqrf`,
+then Qᵀ b, then R x = (Qᵀ b)[0..<n]; what is left of Qᵀ b below that is the residual:
+
+```sysl
+import sh.sysl.sblas.{Side, matrix, matrix_mut}
+import sh.sysl.slapack.Transpose
+import sh.sysl.slapack.heap.{geqrf_alloc, ormqr_alloc}
+
+var a: [6]f64 = [1, 1, 1, 0, 1, 2]                     // [1 0; 1 1; 1 2]: the line c + d t at t = 0, 1, 2
+var b: [3]f64 = [1, 3, 6]
+var tau: [2]f64
+geqrf_alloc(matrix_mut(a[..], 3, 2, 3), tau[..])                                   // A = QR in place
+ormqr_alloc(Side.Left, Transpose.Trans, matrix(a[..], 3, 2, 3), tau[..], matrix_mut(b[..], 3, 1, 3))  // b := Qᵀ b
+val d = b[1] / a[4]                                     // R x = (Qᵀ b)[0..<2], from the bottom
+val c = (b[0] - a[3] * d) / a[0]
+print(c, d, b[2].abs())                                 // 0.8333333333333335 2.5 0.4082482904638634
+```
+
+That is c = 5/6, d = 5/2, and a residual of 1/√6.
+
 The routines themselves take sblas's `GemmWork` packing buffers, sized by `getrf_work_len`,
-`getrs_work_len`, `potrf_work_len` and `potrs_work_len`, and allocate nothing; `sh.sysl.slapack.heap`
+`getrs_work_len`, `potrf_work_len` and `potrs_work_len` — the QR ones a `QrWork`, sized by
+`geqrf_work_len`, `orgqr_work_len` and `ormqr_work_len` — and allocate nothing; `sh.sysl.slapack.heap`
 holds the forms that allocate them per call. The design, and what the language made easy or hard, is in [DESIGN.md](DESIGN.md).
 
 ## Tests
 
 `sysl test .` runs the package's tests against the routines' definitions — hand-factored systems, and
 LAPACK's own residual measures on random matrices of every order from 1 to 64 and past the panel width,
-square, tall and wide, and symmetric positive definite from either triangle — and `oracle/` compares the
-factors with the platform's `dgetrf`, `sgetrf`, `dpotrf` and `spotrf` through the `lapack` binding.
+square, tall and wide, symmetric positive definite from either triangle, and Q's orthogonality and
+products — and `oracle/` compares the factors with the platform's `dgetrf`, `sgetrf`, `dpotrf`,
+`spotrf`, `dgeqrf` and `sgeqrf` through the `lapack` binding.

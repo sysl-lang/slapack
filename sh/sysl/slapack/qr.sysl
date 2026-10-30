@@ -1,0 +1,340 @@
+module sh.sysl.slapack
+@no_alloc
+
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, Strided, StridedMut, GemmWork, GemmWorkLen, Side, Uplo, Diag, matrix_mut, view_mut, gemm, gemm_work_len, gemv, ger, axpy, copy, dot, nrm2, scal}
+import sysl.math.{min, max}
+
+// The QR factorisation, A = Q R, by Householder reflections, and the routines that form Q or apply it.
+//
+// `geqrf` leaves R on and above the diagonal of A and the reflectors below it: reflector `i` is
+// H(i) = I − τᵢ vᵢ vᵢᵀ, where vᵢ is zero above row `i`, one at row `i`, and column `i` of A below it,
+// and Q = H(0) H(1) … H(k−1). The one at row `i` is never stored, so every routine here reads a
+// reflector as that implicit one followed by the column below the diagonal, and the diagonal itself —
+// R's — is never read as part of one.
+//
+// The blocked routines gather `qr_block` reflectors into one, H(i) … H(i+b−1) = I − V T Vᵀ with T
+// upper triangular (`larft`), and apply it with two `gemm`s (`larfb`). Every reflection is applied
+// from the left; one from the right is the left one of the transposed view, as C Q = (Qᵀ Cᵀ)ᵀ.
+
+/** The number of reflectors gathered into one block reflector: LAPACK's default block size for
+ * `geqrf`, `orgqr` and `ormqr`.
+ */
+private[slapack] const qr_block: usize = 32
+
+/** The scratch storage of the QR routines. `block` holds a block reflector's triangular factor and
+ * the product it is applied through, or, where a routine runs unblocked, the one vector each
+ * reflection needs; `gemm` holds the packing buffers of the `gemm` calls. The `_work_len` functions
+ * say how long each must be.
+ */
+struct QrWork[T]
+    block: []T
+    gemm: GemmWork[T]
+
+/** How many elements each buffer of a `QrWork` needs. */
+struct QrWorkLen
+    block: usize
+    gemm: GemmWorkLen
+
+/** The workspace of a routine that applies `k` reflectors of length `rows` to `cols` columns: one
+ * vector of `cols` unblocked; blocked, a `qr_block` square factor and a `cols` x `qr_block` product,
+ * and the buffers of `larfb`'s two `gemm`s for the first, widest block.
+ */
+private work_len[T: Real](rows: usize, cols: usize, k: usize) -> QrWorkLen
+    if k == 0 || cols == 0 then return QrWorkLen(0, GemmWorkLen(0, 0))
+    if k <= qr_block then return QrWorkLen(cols, GemmWorkLen(0, 0))
+    // W += C₂ᵀ V₂ is cols x qr_block over rows − qr_block; C₂ −= V₂ Wᵀ is rows − qr_block x cols over qr_block.
+    val w = gemm_work_len[T](cols, qr_block, rows - qr_block)
+    val c = gemm_work_len[T](rows - qr_block, cols, qr_block)
+    QrWorkLen(qr_block * qr_block + cols * qr_block, GemmWorkLen(max(w.a, c.a), max(w.b, c.b)))
+
+/** Whether `work` is at least `need` long in each buffer. */
+private fits[T](work: QrWork[T], need: QrWorkLen) -> bool = work.block.len >= need.block && work.gemm.a.len >= need.gemm.a && work.gemm.b.len >= need.gemm.b
+
+/** The `k` x `k` triangular factor and the `cols` x `k` product of a block reflector, laid out in the
+ * `block` workspace.
+ */
+private split[T](block: []T, k: usize, cols: usize) -> (MatrixMut[T], MatrixMut[T])
+    val t = matrix_mut(block[0..<k * k], k, k, k)
+    val at = qr_block * qr_block
+    (t, matrix_mut(block[at..<at + cols * k], cols, k, max(cols, 1)))
+
+/** The square root of x² + y², without the overflow or underflow of squaring: LAPACK's `lapy2`. A NaN
+ * in either answers it.
+ */
+private lapy2[T: Real](x: T, y: T) -> T
+    if x.is_nan() then return x
+    if y.is_nan() then return y
+    val (xa, ya) = (x.abs(), y.abs())
+    val (w, z) = (max(xa, ya), min(xa, ya))
+    if z == T.zero() || w > T.max_value() then return w
+    val q = z / w
+    w * (T.one() + q * q).sqrt()
+
+/** LAPACK's `larfg`: the reflector H = I − τ v vᵀ, v = (1, x'), with H (alpha, x) = (beta, 0).
+ *
+ * Answers `(beta, tau)` and overwrites `x` with the reflector's tail x'. When `x` is already zero (or
+ * empty) τ is zero and H the identity, and `beta` is `alpha`. Otherwise τ lies in [1, 2] and `beta`
+ * has the sign opposite `alpha`'s; a `beta` too small for its reciprocal to be safe is computed from
+ * the vector scaled up, as LAPACK does, so the tail does not overflow.
+ */
+larfg[T: Real](alpha: T, x: StridedMut[T]) -> (T, T)
+    if x.len == 0 then return (alpha, T.zero())
+    var xnorm = nrm2(x.as_view())
+    if xnorm == T.zero() then return (alpha, T.zero())
+    var a = alpha
+    var beta = -lapy2(a, xnorm).copysign(a)
+    val small = T.safe_min() / T.epsilon()
+    var scaled = 0
+    if beta.abs() < small
+        // Scale up until beta is safe; at most twenty times, as LAPACK bounds it.
+        val up = T.one() / small
+        loop
+            scaled += 1
+            scal(up, x)
+            beta = beta * up
+            a = a * up
+            if beta.abs() >= small || scaled >= 20 then break
+        xnorm = nrm2(x.as_view())
+        beta = -lapy2(a, xnorm).copysign(a)
+    val tau = (beta - a) / beta
+    scal(T.one() / (a - beta), x)
+    for _ in 0..<scaled do beta = beta * small
+    (beta, tau)
+
+/** LAPACK's `larf`, from the left: C := H C for H = I − τ v vᵀ, v = (1, `tail`). `w` holds Cᵀ v and is
+ * at least `c.cols` long. A τ of zero is the identity and touches nothing.
+ */
+private larf[T: Real](tau: T, tail: Strided[T], c: MatrixMut[T], w: []T)
+    if tau == T.zero() || c.cols == 0 then return
+    val n = c.cols
+    val below = c.rows - 1
+    val wv = view_mut(w[0..<n])
+    // w := Cᵀ v, the implicit one reading row 0 of C.
+    copy(c.as_view().row(0), wv)
+    if below > 0 then gemv(T.one(), c.as_view().block(1, 0, below, n).t(), tail, T.one(), wv)
+    // C −= τ v wᵀ.
+    axpy(-tau, wv.as_view(), c.row(0))
+    if below > 0 then ger(-tau, tail, wv.as_view(), c.block(1, 0, below, n))
+
+/** B := B A for a `k` x `k` triangular A, of which only the `uplo` triangle is read — and with `Unit`
+ * not its diagonal either, which is taken to be ones. BLAS's `trmm` from the right, which sblas does
+ * not have; here each column of the product is one `gemv` over the columns of B it combines.
+ */
+private trmm_right[T: Real](uplo: Uplo, diag: Diag, a: Matrix[T], b: MatrixMut[T])
+    val (n, k) = (b.rows, b.cols)
+    if n == 0 then return
+    val bv = b.as_view()
+    for step in 0..<k
+        // Column j of the product combines columns left of j (upper) or right of it (lower), so walking
+        // away from them leaves each still unwritten when it is read.
+        val j = if uplo == Uplo.Upper then k - 1 - step else step
+        val d = if diag == Diag.Unit then T.one() else a.at(j, j)
+        val (from, len) = if uplo == Uplo.Upper then (0, j) else (j + 1, k - j - 1)
+        if len > 0
+            gemv(T.one(), bv.block(0, from, n, len), a.block(from, j, len, 1).col(0), d, b.col(j))
+        else if d != T.one()
+            scal(d, b.col(j))
+
+/** LAPACK's `larft`, forward and columnwise: the upper triangular T with H(0) H(1) … H(k−1) =
+ * I − V T Vᵀ, for the `k` reflectors in the columns of `v` (read below the diagonal only) and their
+ * scales in `tau`. Only T's upper triangle is written.
+ */
+private larft[T: Real](v: Matrix[T], tau: []const T, t: MatrixMut[T])
+    val (rows, k) = (v.rows, v.cols)
+    val tv = t.as_view()
+    for i in 0..<k
+        val ti = tau[i]
+        if ti == T.zero()
+            // H(i) is the identity: its column of T is zero.
+            for r in 0..i do t.set(r, i, T.zero())
+            continue
+        if i > 0
+            // T(0:i, i) = −τᵢ V(i:, 0:i)ᵀ vᵢ, the implicit one meeting row i ...
+            val col = t.block(0, i, i, 1).col(0)
+            for r in 0..<i do col.set(r, -ti * v.at(i, r))
+            if i + 1 < rows then gemv(-ti, v.block(i + 1, 0, rows - i - 1, i).t(), v.block(i + 1, i, rows - i - 1, 1).col(0), T.one(), col)
+            // ... then T(0:i, i) = T(0:i, 0:i) T(0:i, i), each row reading only the entries below it.
+            for r in 0..<i do t.set(r, i, dot(tv.block(r, r, 1, i - r).row(0), tv.block(r, i, i - r, 1).col(0)))
+        t.set(i, i, ti)
+
+/** LAPACK's `larfb`, from the left, forward and columnwise: C := H C (`NoTrans`) or Hᵀ C (`Trans`) for
+ * the block reflector H = I − V T Vᵀ. V is `v`'s unit lower trapezoid, its diagonal and what lies
+ * above it never read; `w` holds the `c.cols` x `k` product Cᵀ V T (or Tᵀ).
+ */
+private larfb[T: Real](trans: Transpose, v: Matrix[T], t: Matrix[T], c: MatrixMut[T], w: MatrixMut[T], work: GemmWork[T])
+    val (m, n, k) = (c.rows, c.cols, v.cols)
+    if m == 0 || n == 0 then return
+    val cv = c.as_view()
+    // W := C₁ᵀ V₁ + C₂ᵀ V₂.
+    for j in 0..<k do copy(cv.row(j), w.col(j))
+    trmm_right(Uplo.Lower, Diag.Unit, v.block(0, 0, k, k), w)
+    if m > k then gemm(T.one(), cv.block(k, 0, m - k, n).t(), v.block(k, 0, m - k, k), T.one(), w, work)
+    // W := W Tᵀ for H, W T for Hᵀ.
+    if trans == Transpose.NoTrans then trmm_right(Uplo.Lower, Diag.NonUnit, t.t(), w) else trmm_right(Uplo.Upper, Diag.NonUnit, t, w)
+    // C −= V Wᵀ: C₂ by a gemm, C₁ through W V₁ᵀ.
+    val wv = w.as_view()
+    if m > k then gemm(-T.one(), v.block(k, 0, m - k, k), wv.t(), T.one(), c.block(k, 0, m - k, n), work)
+    trmm_right(Uplo.Upper, Diag.Unit, v.block(0, 0, k, k).t(), w)
+    for j in 0..<k do axpy(-T.one(), wv.col(j), c.row(j))
+
+/** The unblocked factorisation, LAPACK's `geqr2`, with `w` at least `a.cols` long. */
+private reflect_columns[T: Real](a: MatrixMut[T], tau: []T, w: []T)
+    val (m, n) = (a.rows, a.cols)
+    for i in 0..<min(m, n)
+        val (beta, ti) = larfg(a.at(i, i), a.block(i + 1, i, m - i - 1, 1).col(0))
+        a.set(i, i, beta)
+        tau[i] = ti
+        if i + 1 < n then larf(ti, a.as_view().block(i + 1, i, m - i - 1, 1).col(0), a.block(i, i + 1, m - i, n - i - 1), w)
+
+/** LAPACK's `geqr2`: the QR factorisation of an `m` x `n` A, unblocked.
+ *
+ * Leaves R in A's upper trapezoid and the `min(m, n)` reflectors below its diagonal, their scales in
+ * `tau[0..<min(m, n)]`. `work` is at least `a.cols` long. Traps if `tau` or `work` is shorter.
+ */
+geqr2[T: Real](a: MatrixMut[T], tau: []T, work: []T)
+    assert(tau.len >= min(a.rows, a.cols), "tau is shorter than min(m, n)")
+    assert(work.len >= a.cols, "geqr2's work is shorter than A's columns")
+    reflect_columns(a, tau, work)
+
+/** How long each buffer of the `QrWork` that `geqrf` takes must be, for an `m` x `n` A. A matrix whose
+ * shorter side is `qr_block` or less is factored unblocked and needs one vector of `n`.
+ */
+geqrf_work_len[T: Real](m: usize, n: usize) -> QrWorkLen = work_len[T](m, n, min(m, n))
+
+/** LAPACK's `geqrf`: the QR factorisation of an `m` x `n` A, blocked.
+ *
+ * The result is `geqr2`'s — R on and above A's diagonal, the reflectors below it and their scales in
+ * `tau[0..<min(m, n)]`, so that A = Q R with Q = H(0) … H(k−1) — computed a block of columns at a
+ * time. A QR factorisation exists for every matrix, so nothing about the data is an error: a zero or
+ * dependent column gives a zero on R's diagonal, and a NaN spreads. Traps if `tau` is shorter than
+ * `min(m, n)` or `work` than `geqrf_work_len` says.
+ */
+geqrf[T: Real](a: MatrixMut[T], tau: []T, work: QrWork[T])
+    val (m, n) = (a.rows, a.cols)
+    val k = min(m, n)
+    assert(tau.len >= k, "tau is shorter than min(m, n)")
+    assert(fits(work, geqrf_work_len[T](m, n)), "geqrf's workspace is shorter than geqrf_work_len says")
+    if k <= qr_block
+        reflect_columns(a, tau, work.block)
+        return
+    for var i = 0; i < k; i += qr_block
+        val ib = min(k - i, qr_block)
+        // Factor the panel, then apply its reflectors, gathered into one, to the columns right of it.
+        reflect_columns(a.block(i, i, m - i, ib), tau[i..<i + ib], work.block)
+        if i + ib < n
+            val v = a.as_view().block(i, i, m - i, ib)
+            val (t, w) = split(work.block, ib, n - i - ib)
+            larft(v, tau[i..<i + ib], t)
+            larfb(Transpose.Trans, v, t.as_view(), a.block(i, i + ib, m - i, n - i - ib), w, work.gemm)
+
+/** Q's columns from the reflectors in place, LAPACK's `org2r`, with `w` at least `a.cols` long. */
+private form_q[T: Real](a: MatrixMut[T], tau: []const T, w: []T)
+    val (m, n, k) = (a.rows, a.cols, tau.len)
+    // The columns past the reflectors start as the identity's.
+    for j in k..<n
+        for r in 0..<m do a.set(r, j, T.zero())
+        a.set(j, j, T.one())
+    // Each reflector, last first, is applied to the columns right of it and then becomes its own column
+    // of Q, H(i) eᵢ = eᵢ − τᵢ vᵢ.
+    for step in 0..<k
+        val i = k - 1 - step
+        if i + 1 < n then larf(tau[i], a.as_view().block(i + 1, i, m - i - 1, 1).col(0), a.block(i, i + 1, m - i, n - i - 1), w)
+        if i + 1 < m then scal(-tau[i], a.block(i + 1, i, m - i - 1, 1).col(0))
+        a.set(i, i, T.one() - tau[i])
+        for r in 0..<i do a.set(r, i, T.zero())
+
+/** LAPACK's `org2r`: Q's first `n` columns, unblocked, in place of the `k = tau.len` reflectors that
+ * `geqrf` left in the first `k` columns of the `m` x `n` `a`.
+ *
+ * Reads only the reflectors, below the diagonal of those columns, and overwrites all of `a`. `work`
+ * is at least `a.cols` long. Traps unless `k <= n <= m`, or if `work` is short.
+ */
+org2r[T: Real](a: MatrixMut[T], tau: []const T, work: []T)
+    assert(a.cols <= a.rows, "Q has more columns than rows")
+    assert(tau.len <= a.cols, "more reflectors than Q has columns")
+    assert(work.len >= a.cols, "org2r's work is shorter than A's columns")
+    form_q(a, tau, work)
+
+/** How long each buffer of the `QrWork` that `orgqr` takes must be, for an `m` x `n` Q from `k`
+ * reflectors. `k` of `qr_block` or fewer is formed unblocked and needs one vector of `n`.
+ */
+orgqr_work_len[T: Real](m: usize, n: usize, k: usize) -> QrWorkLen = work_len[T](m, n, k)
+
+/** LAPACK's `orgqr`: Q's first `n` columns, blocked, in place of the `k = tau.len` reflectors that
+ * `geqrf` left in the first `k` columns of the `m` x `n` `a`.
+ *
+ * `n` may be `k`, the thin Q of a tall A, or as many as `m`, the whole of Q. The result is `org2r`'s,
+ * a block of reflectors at a time: only the reflectors are read, and all of `a` is written. Traps
+ * unless `k <= n <= m`, or if `work` is shorter than `orgqr_work_len` says.
+ */
+orgqr[T: Real](a: MatrixMut[T], tau: []const T, work: QrWork[T])
+    val (m, n, k) = (a.rows, a.cols, tau.len)
+    assert(n <= m, "Q has more columns than rows")
+    assert(k <= n, "more reflectors than Q has columns")
+    assert(fits(work, orgqr_work_len[T](m, n, k)), "orgqr's workspace is shorter than orgqr_work_len says")
+    if k <= qr_block
+        form_q(a, tau, work.block)
+        return
+    // The columns past the reflectors are the identity's; the rows above them in those columns are zero.
+    form_q(a.block(k, k, m - k, n - k), tau[0..<0], work.block)
+    for j in k..<n
+        for r in 0..<k do a.set(r, j, T.zero())
+    // Each block, last first, applies its reflector to the columns right of it, then forms its own.
+    var i = (k - 1) / qr_block * qr_block
+    loop
+        val ib = min(qr_block, k - i)
+        if i + ib < n
+            val v = a.as_view().block(i, i, m - i, ib)
+            val (t, w) = split(work.block, ib, n - i - ib)
+            larft(v, tau[i..<i + ib], t)
+            larfb(Transpose.NoTrans, v, t.as_view(), a.block(i, i + ib, m - i, n - i - ib), w, work.gemm)
+        form_q(a.block(i, i, m - i, ib), tau[i..<i + ib], work.block)
+        for j in i..<i + ib
+            for r in 0..<i do a.set(r, j, T.zero())
+        if i == 0 then break
+        i -= qr_block
+
+/** Q C (`NoTrans`) or Qᵀ C (`Trans`) in place, Q given by the `k = tau.len` reflectors in `a`'s first
+ * `k` columns, which are as long as C has rows.
+ */
+private apply_q[T: Real](trans: Transpose, a: Matrix[T], tau: []const T, c: MatrixMut[T], work: QrWork[T])
+    val (m, n, k) = (c.rows, c.cols, tau.len)
+    if m == 0 || n == 0 || k == 0 then return
+    // Qᵀ = H(k−1) … H(0) applies H(0) first; Q = H(0) … H(k−1) applies H(k−1) first.
+    val forward = trans == Transpose.Trans
+    if k <= qr_block
+        for step in 0..<k
+            val i = if forward then step else k - 1 - step
+            larf(tau[i], a.block(i + 1, i, m - i - 1, 1).col(0), c.block(i, 0, m - i, n), work.block)
+        return
+    val blocks = (k + qr_block - 1) / qr_block
+    for step in 0..<blocks
+        val i = (if forward then step else blocks - 1 - step) * qr_block
+        val ib = min(qr_block, k - i)
+        val v = a.block(i, i, m - i, ib)
+        val (t, w) = split(work.block, ib, n)
+        larft(v, tau[i..<i + ib], t)
+        larfb(trans, v, t.as_view(), c.block(i, 0, m - i, n), w, work.gemm)
+
+/** How long each buffer of the `QrWork` that `ormqr` takes must be, to apply `k` reflectors from
+ * `side` to an `m` x `n` C.
+ */
+ormqr_work_len[T: Real](side: Side, m: usize, n: usize, k: usize) -> QrWorkLen = if side == Side.Left then work_len[T](m, n, k) else work_len[T](n, m, k)
+
+/** LAPACK's `ormqr`: C := Q C, Qᵀ C, C Q or C Qᵀ in place, Q being the product of the `k = tau.len`
+ * reflectors `geqrf` left in the first `k` columns of `a`.
+ *
+ * `side` says which side Q stands on and `trans` whether it is transposed. The reflectors are as long
+ * as Q's order, C's rows from the `Left` and its columns from the `Right`; only the part of `a` below
+ * the diagonal of its first `k` columns is read, so the whole of a wide `geqrf`'s A may be passed.
+ * From the right, C Q = (Qᵀ Cᵀ)ᵀ: the left-hand product on `c.t()` with the transpose flipped. Traps
+ * if `a`'s rows are not Q's order, if `k` exceeds it or `a`'s columns, or if `work` is shorter than
+ * `ormqr_work_len` says.
+ */
+ormqr[T: Real](side: Side, trans: Transpose, a: Matrix[T], tau: []const T, c: MatrixMut[T], work: QrWork[T])
+    val k = tau.len
+    val order = if side == Side.Left then c.rows else c.cols
+    assert(a.rows == order, "the reflectors are not as long as Q's order on that side of C")
+    assert(k <= a.cols && k <= order, "more reflectors than A holds")
+    assert(fits(work, ormqr_work_len[T](side, c.rows, c.cols, k)), "ormqr's workspace is shorter than ormqr_work_len says")
+    if side == Side.Left then apply_q(trans, a, tau, c, work) else apply_q(if trans == Transpose.NoTrans then Transpose.Trans else Transpose.NoTrans, a, tau, c.t(), work)

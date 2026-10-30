@@ -1,7 +1,7 @@
 module sh.sysl.slapack.heap
 @tests
 
-import sh.sysl.sblas.{Uplo, matrix, matrix_mut}
+import sh.sysl.sblas.{Side, Uplo, matrix, matrix_mut}
 import sh.sysl.slapack.{Error, Transpose}
 import sysl.buf.{Buf, buf_filled}
 
@@ -61,6 +61,47 @@ heap_chol_not_pd()
     assert(potrf_alloc(Uplo.Upper, matrix_mut(e[0..<0], 0, 0, 1)) == Ok(()))
     potrs_alloc(Uplo.Upper, matrix(e[0..<0], 0, 0, 1), matrix_mut(e[0..<0], 0, 2, 1))
     assert(e[0] == 9)
+
+@test("geqrf_alloc, orgqr_alloc and ormqr_alloc factor past a block: Qᵀ A is R, and Q Qᵀ C is C")
+heap_qr_blocked()
+    val m: usize = 100
+    val n: usize = 80
+    val s: Buf[f64] = buf_filled(m * n, 0)
+    for j in 0..<n
+        for i in 0..<m
+            s[i + j * m] = f64((i * 7 + j * 3) % 11) - 5 + (if i == j then 20 else 0)
+    val a: Buf[f64] = buf_filled(m * n, 0)
+    for i in 0..<m * n do a[i] = s[i]
+    val tau: Buf[f64] = buf_filled(n, 0)
+    geqrf_alloc(matrix_mut(s.view(), m, n, m), tau.view())
+    // Qᵀ A, from the left, is R.
+    ormqr_alloc(Side.Left, Transpose.Trans, matrix(s.view(), m, n, m), tau.view(), matrix_mut(a.view(), m, n, m))
+    for j in 0..<n
+        for i in 0..<m
+            val want = if i <= j then s[i + j * m] else 0
+            assert((a[i + j * m] - want).abs() < 1e-11)
+    // C Q Qᵀ, from the right, is C again.
+    val c: Buf[f64] = buf_filled(3 * m, 0)
+    for i in 0..<3 * m do c[i] = f64(i % 13)
+    ormqr_alloc(Side.Right, Transpose.NoTrans, matrix(s.view(), m, n, m), tau.view(), matrix_mut(c.view(), 3, m, 3))
+    ormqr_alloc(Side.Right, Transpose.Trans, matrix(s.view(), m, n, m), tau.view(), matrix_mut(c.view(), 3, m, 3))
+    for i in 0..<3 * m
+        assert((c[i] - f64(i % 13)).abs() < 1e-11)
+    // The thin Q has orthonormal columns.
+    orgqr_alloc(matrix_mut(s.view(), m, n, m), tau.view())
+    for j in 0..<n
+        var d = 0.0
+        for i in 0..<m do d += s[i + j * m] * s[i + j * m]
+        assert((d - 1).abs() < 1e-12)
+
+@test("the QR allocating forms on empty input need nothing and do nothing")
+heap_qr_empty()
+    var s: [1]f32 = [9]
+    var tau: [1]f32 = [7]
+    geqrf_alloc(matrix_mut(s[0..<0], 0, 4, 1), tau[..])
+    orgqr_alloc(matrix_mut(s[0..<0], 0, 0, 1), tau[0..<0])
+    ormqr_alloc(Side.Left, Transpose.NoTrans, matrix(s[0..<0], 0, 0, 1), tau[0..<0], matrix_mut(s[0..<0], 0, 3, 1))
+    assert(s[0] == 9 && tau[0] == 7)
 
 @test("getrf_alloc and getrs_alloc on empty input need nothing and do nothing")
 heap_lu_empty()

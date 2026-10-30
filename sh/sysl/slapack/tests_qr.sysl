@@ -1,0 +1,583 @@
+module sh.sysl.slapack
+@tests
+
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, Side, matrix, matrix_mut, view_mut}
+import sysl.buf.{Buf, buf_filled}
+import sysl.math.min
+
+// geqrf, orgqr and ormqr against their definitions: a factorisation worked by hand, exactly, and
+// generated matrices checked by LAPACK's own measures — the residual ‖A − Q R‖ / (max(m, n) ‖A‖ ε),
+// the loss of orthogonality ‖I − Qᵀ Q‖ / (m ε) and the product residual ‖op(Q) C − ormqr‖ /
+// (max(m, p) ‖C‖ ε), in the 1-norm and under LAPACK's test threshold of 30. Every workspace is
+// filled with NaN and every matrix sits in padding of NaN, so that a read of either, or a write past
+// a matrix, shows. The stream and the norms are tests_lu's; agreement with the platform's LAPACK is in
+// the oracle's tests.
+
+/** geqrf in a workspace of exactly the length geqrf_work_len gives, every element NaN. */
+private factor_qr[T: Real](a: MatrixMut[T], tau: []T)
+    val len = geqrf_work_len[T](a.rows, a.cols)
+    val block: Buf[T] = buf_filled(len.block, T.nan())
+    val pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
+    val pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
+    geqrf(a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+
+/** orgqr in a workspace of exactly the length orgqr_work_len gives, every element NaN. */
+private form_qr[T: Real](a: MatrixMut[T], tau: []const T)
+    val len = orgqr_work_len[T](a.rows, a.cols, tau.len)
+    val block: Buf[T] = buf_filled(len.block, T.nan())
+    val pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
+    val pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
+    orgqr(a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+
+/** ormqr in a workspace of exactly the length ormqr_work_len gives, every element NaN. */
+private apply_qr[T: Real](side: Side, trans: Transpose, a: Matrix[T], tau: []const T, c: MatrixMut[T])
+    val len = ormqr_work_len[T](side, c.rows, c.cols, tau.len)
+    val block: Buf[T] = buf_filled(len.block, T.nan())
+    val pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
+    val pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
+    ormqr(side, trans, a, tau, c, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+
+/** A copy of `s`. */
+private copy_of[T: Real](s: []const T) -> Buf[T]
+    val c: Buf[T] = buf_filled(s.len, T.zero())
+    for i in 0..<s.len do c[i] = s[i]
+    c
+
+/** `r / (scale ε)`, or `r` itself where the scale is zero. */
+private ratio_of[T: Real](r: T, scale: T) -> T = if scale == T.zero() then r else r / (scale * T.epsilon())
+
+/** Whether every element of the column-major storage `s` outside its `m` x `n` matrix of leading
+ * dimension `ld` is still NaN.
+ */
+private padding_kept[T: Real](s: []const T, m: usize, n: usize, ld: usize) -> bool
+    for j in 0..<n
+        for i in m..<ld
+            if !s[i + j * ld].is_nan() then return false
+    true
+
+/** The reflectors `geqrf` left in the first `k` columns of `f`, in a fresh `m` x `cols` matrix of
+ * leading dimension `ld`, every other element — R's place, the columns past `k`, the padding — NaN, so
+ * that orgqr reading any of them shows.
+ */
+private reflectors[T: Real](f: Matrix[T], k: usize, cols: usize, ld: usize) -> Buf[T]
+    val q: Buf[T] = buf_filled(ld * cols, T.nan())
+    for j in 0..<k
+        for i in j + 1..<f.rows
+            q[i + j * ld] = f.at(i, j)
+    q
+
+/** ‖A − Q R‖₁ / (max(m, n) ‖A‖₁ ε), R being `f`'s upper trapezoid and Q's first `q.cols` columns the
+ * ones it is multiplied by.
+ */
+private qr_ratio[T: Real](a: Matrix[T], q: Matrix[T], f: Matrix[T]) -> T
+    val (m, n) = (a.rows, a.cols)
+    val diff = (i: usize, j: usize) ->
+        var s = T.zero()
+        for p in 0..<min(j + 1, q.cols)
+            s = s + q.at(i, p) * f.at(p, j)
+        a.at(i, j) - s
+    ratio_of(norm1(m, n, diff), T(max1(m, n)) * norm1(m, n, (i, j) -> a.at(i, j)))
+
+/** ‖I − Qᵀ Q‖₁ / (m ε) for the `m` x `n` Q in `q`. */
+private orth_ratio[T: Real](q: Matrix[T]) -> T
+    val n = q.cols
+    val diff = (i: usize, j: usize) ->
+        var s = if i == j then T.one() else T.zero()
+        for p in 0..<q.rows
+            s = s - q.at(p, i) * q.at(p, j)
+        s
+    norm1(n, n, diff) / (T(max1(q.rows, q.rows)) * T.epsilon())
+
+/** ‖op(Q) C − D‖₁ / (max(m, p) ‖C‖₁ ε) for an order-`m` Q, an `m` x `p` C, and D what ormqr made of C
+ * from the left; from the right C is `p` x `m` and the product C op(Q).
+ */
+private product_ratio[T: Real](side: Side, trans: Transpose, q: Matrix[T], c: Matrix[T], d: Matrix[T]) -> T
+    val qq = if trans == Transpose.Trans then q.t() else q
+    val diff = (i: usize, j: usize) ->
+        var s = T.zero()
+        if side == Side.Left
+            for p in 0..<qq.cols do s = s + qq.at(i, p) * c.at(p, j)
+        else
+            for p in 0..<qq.rows do s = s + c.at(i, p) * qq.at(p, j)
+        s - d.at(i, j)
+    val norm = norm1(c.rows, c.cols, (i, j) -> c.at(i, j))
+    ratio_of(norm1(c.rows, c.cols, diff), T(max1(c.rows, c.cols)) * norm)
+
+/** Factors the `m` x `n` matrix in `a` (leading dimension `ld`, the padding NaN) and checks everything
+ * there is to check of it: the padding and the spare element of `tau` untouched, every τ zero or in
+ * [1, 2], the residual and orthogonality of the whole Q and — when A is tall — of the thin one, and
+ * each of ormqr's four products against the whole Q formed explicitly.
+ */
+private check_qr_of[T: Real](a: []const T, m: usize, n: usize, ld: usize, seed: u64)
+    val k = min(m, n)
+    val f = copy_of(a)
+    val tau: Buf[T] = buf_filled(k + 1, T.nan())
+    factor_qr(matrix_mut(f.view(), m, n, ld), tau.view())
+    assert(padding_kept(f.view(), m, n, ld), s"geqrf wrote past its matrix at $m x $n")
+    assert(tau[k].is_nan(), s"geqrf wrote past tau[min(m, n)] at $m x $n")
+    for i in 0..<k
+        assert(tau[i] == T.zero() || (tau[i] >= T.one() && tau[i] <= T(2)), s"τ $i is ${f64(tau[i])} at $m x $n")
+    val am = matrix(a, m, n, ld)
+    val fm = matrix(f.view(), m, n, ld)
+    val taus = tau.view()[0..<k]
+    // The whole of Q, m x m.
+    val ldq = m + 2
+    val q = reflectors(fm, k, m, ldq)
+    form_qr(matrix_mut(q.view(), m, m, ldq), taus)
+    assert(padding_kept(q.view(), m, m, ldq), s"orgqr wrote past its matrix at $m x $n")
+    val qm = matrix(q.view(), m, m, ldq)
+    val r = qr_ratio(am, qm, fm)
+    assert(r < T(threshold), s"‖A − Q R‖ / (max(m, n) ‖A‖ ε) = ${f64(r)} at $m x $n")
+    val o = orth_ratio(qm)
+    assert(o < T(threshold), s"‖I − Qᵀ Q‖ / (m ε) = ${f64(o)} at $m x $n")
+    if m > n
+        // The thin Q, m x n, from the same reflectors.
+        val thin = reflectors(fm, k, n, m + 1)
+        form_qr(matrix_mut(thin.view(), m, n, m + 1), taus)
+        assert(padding_kept(thin.view(), m, n, m + 1), s"orgqr wrote past the thin Q at $m x $n")
+        val tm = matrix(thin.view(), m, n, m + 1)
+        val rt = qr_ratio(am, tm, fm)
+        assert(rt < T(threshold), s"‖A − Q₁ R₁‖ / (max(m, n) ‖A‖ ε) = ${f64(rt)} at $m x $n")
+        val ot = orth_ratio(tm)
+        assert(ot < T(threshold), s"‖I − Q₁ᵀ Q₁‖ / (m ε) = ${f64(ot)} at $m x $n")
+    // ormqr's four products with a C of p columns (from the left) or rows (from the right).
+    var g = Stream(seed)
+    val p: usize = 5
+    for side in [Side.Left, Side.Right]
+        for trans in [Transpose.NoTrans, Transpose.Trans]
+            val (rows, cols) = if side == Side.Left then (m, p) else (p, m)
+            val c = random[T](&g, rows, cols, rows + 1, T.nan())
+            val d = copy_of(c.view())
+            apply_qr(side, trans, fm, taus, matrix_mut(d.view(), rows, cols, rows + 1))
+            assert(padding_kept(d.view(), rows, cols, rows + 1), s"ormqr wrote past C at $m x $n")
+            val pr = product_ratio(side, trans, qm, matrix(c.view(), rows, cols, rows + 1), matrix(d.view(), rows, cols, rows + 1))
+            assert(pr < T(threshold), s"‖op(Q) C − ormqr‖ / (max(m, p) ‖C‖ ε) = ${f64(pr)} at $m x $n")
+
+/** check_qr_of a random `m` x `n` matrix with padding rows. */
+private check_qr[T: Real](m: usize, n: usize, seed: u64)
+    var g = Stream(seed)
+    val ld = m + 3
+    val a = random[T](&g, m, n, ld, T.nan())
+    check_qr_of(a.view(), m, n, ld, seed + 1)
+
+private sweep_qr_small[T: Real](seed: u64)
+    for n in 1..64
+        check_qr[T](n, n, seed + u64(n))
+
+@test("geqrf, orgqr and ormqr on random square matrices of every order 1 to 64: residuals and orthogonality within LAPACK's threshold, f64")
+qr_random_small_f64()
+    sweep_qr_small[f64](1)
+
+@test("geqrf, orgqr and ormqr on random square matrices of every order 1 to 64: residuals and orthogonality within LAPACK's threshold, f32")
+qr_random_small_f32()
+    sweep_qr_small[f32](1)
+
+/** Orders past the block width, a block edge and a column past one, and tall and wide shapes with
+ * blocks of both kinds.
+ */
+private sweep_qr_blocked[T: Real](seed: u64)
+    val orders: [6]usize = [65, 100, 128, 129, 193, 200]
+    for n in orders
+        check_qr[T](n, n, seed + u64(n))
+    val shapes: [12](usize, usize) = [(150, 70), (70, 150), (200, 65), (65, 200), (130, 3), (3, 130), (300, 100), (100, 300), (97, 33), (33, 97), (64, 33), (33, 64)]
+    for (m, n) in shapes
+        check_qr[T](m, n, seed + u64(m * 1000 + n))
+
+@test("geqrf, orgqr and ormqr past the block width: square, tall and wide, within LAPACK's threshold, f64")
+qr_random_blocked_f64()
+    sweep_qr_blocked[f64](7)
+
+@test("geqrf, orgqr and ormqr past the block width: square, tall and wide, within LAPACK's threshold, f32")
+qr_random_blocked_f32()
+    sweep_qr_blocked[f32](7)
+
+@test("every shape up to 12 x 12, tall and wide, factors within LAPACK's threshold")
+qr_random_nonsquare()
+    for m in 1..12
+        for n in 1..12
+            check_qr[f64](m, n, u64(m * 100 + n))
+            check_qr[f32](m, n, u64(m * 100 + n))
+
+// --- Hand-checked ----------------------------------------------------------------------------------
+
+@test("a 2 x 2 factorisation worked by hand: R, the reflector, τ and Q exactly")
+qr_by_hand()
+    // A = [0 2; 1 3]. v = (1, 1) and τ = 1 take (0, 1) to (−1, 0), and (2, 3) to (−3, −2); the second
+    // column has nothing below its diagonal, so its τ is 0. Q = I − v vᵀ = [0 −1; −1 0].
+    var s: [4]f64 = [0, 1, 2, 3]
+    var tau: [2]f64 = [9, 9]
+    factor_qr(matrix_mut(s[..], 2, 2, 2), tau[..])
+    assert(s[0] == -1 && s[1] == 1 && s[2] == -3 && s[3] == -2)
+    assert(tau[0] == 1 && tau[1] == 0)
+    form_qr(matrix_mut(s[..], 2, 2, 2), tau[..])
+    assert(s[0] == 0 && s[1] == -1 && s[2] == -1 && s[3] == 0)
+    // Q (1, 2) = (−2, −1), from the left and, as (1, 2) Q, from the right.
+    var r: [4]f64 = [0, 1, 2, 3]
+    factor_qr(matrix_mut(r[..], 2, 2, 2), tau[..])
+    var b: [2]f64 = [1, 2]
+    apply_qr(Side.Left, Transpose.NoTrans, matrix(r[..], 2, 2, 2), tau[..], matrix_mut(b[..], 2, 1, 2))
+    assert(b[0] == -2 && b[1] == -1)
+    var row: [2]f64 = [1, 2]
+    apply_qr(Side.Right, Transpose.Trans, matrix(r[..], 2, 2, 2), tau[..], matrix_mut(row[..], 1, 2, 1))
+    assert(row[0] == -2 && row[1] == -1)
+
+@test("larfg: a zero tail is the identity, and beta takes the sign opposite alpha's")
+qr_larfg()
+    var z: [2]f64 = [0, 0]
+    val (b0, t0) = larfg(5.0, view_mut(z[..]))
+    assert(b0 == 5 && t0 == 0 && z[0] == 0 && z[1] == 0)
+    var e: [1]f64
+    val (b1, t1) = larfg(-3.0, view_mut(e[0..<0]))
+    assert(b1 == -3 && t1 == 0)
+    var x: [1]f64 = [4]
+    val (b2, t2) = larfg(3.0, view_mut(x[..]))
+    assert(b2 == -5 && (t2 - 1.6).abs() < 1e-15 && x[0] == 0.5)
+    var y: [1]f64 = [4]
+    val (b3, _) = larfg(-3.0, view_mut(y[..]))
+    assert(b3 == 5)
+
+/** larfg on (3s, 4s) for a subnormal s, whose 1 / (alpha − beta) = 1 / 8s overflows unless the vector
+ * is scaled up first: beta is −5s, τ is 8/5 and the tail 1/2, exactly as at any other scale.
+ */
+private larfg_tiny[T: Real]()
+    val s = T.safe_min() * T.epsilon() * T(4)
+    var x: [1]T = [T(4) * s]
+    val (beta, tau) = larfg(T(3) * s, view_mut(x[..]))
+    assert(beta == -T(5) * s && tau == T(8) / T(5) && x[0] == T.one() / T(2))
+
+@test("larfg scales up a column whose reflector's reciprocal would overflow, and scales beta back exactly")
+qr_larfg_tiny()
+    larfg_tiny[f64]()
+    larfg_tiny[f32]()
+
+@test("an upper triangular matrix is its own R: every τ zero and A untouched, unblocked and blocked")
+qr_already_triangular()
+    val orders: [2]usize = [5, 100]
+    for n in orders
+        var g = Stream(u64(n))
+        val a = random[f64](&g, n, n, n, 0)
+        for j in 0..<n
+            for i in j + 1..<n do a[i + j * n] = 0
+        val f = copy_of(a.view())
+        val tau: Buf[f64] = buf_filled(n, f64.nan())
+        factor_qr(matrix_mut(f.view(), n, n, n), tau.view())
+        for i in 0..<n * n
+            assert(f[i] == a[i])
+        for t in tau.view()
+            assert(t == 0)
+
+@test("a zero matrix factors to R = 0 with every τ zero, and its Q is the identity exactly")
+qr_zero_matrix()
+    val shapes: [3](usize, usize) = [(4, 3), (70, 90), (90, 70)]
+    for (m, n) in shapes
+        val f: Buf[f32] = buf_filled(m * n, 0)
+        val k = min(m, n)
+        val tau: Buf[f32] = buf_filled(k, f32.nan())
+        factor_qr(matrix_mut(f.view(), m, n, m), tau.view())
+        for v in f.view()
+            assert(v == 0)
+        for t in tau.view()
+            assert(t == 0)
+        val q = reflectors(matrix(f.view(), m, n, m), k, m, m)
+        form_qr(matrix_mut(q.view(), m, m, m), tau.view())
+        for j in 0..<m
+            for i in 0..<m
+                assert(q[i + j * m] == (if i == j then 1 else 0))
+
+// --- Zero columns, rank deficiency, scaling, NaN ---------------------------------------------------
+
+/** A random `m` x `n` matrix with the `zeros` columns zeroed: each such column's τ is zero and its
+ * column of R zero exactly, and the factorisation still meets every check.
+ */
+private check_qr_zero_columns[T: Real](m: usize, n: usize, zeros: []const usize, seed: u64)
+    var g = Stream(seed)
+    val ld = m + 1
+    val a = random[T](&g, m, n, ld, T.nan())
+    for c in zeros
+        for i in 0..<m do a[i + c * ld] = T.zero()
+    val f = copy_of(a.view())
+    val tau: Buf[T] = buf_filled(min(m, n), T.nan())
+    factor_qr(matrix_mut(f.view(), m, n, ld), tau.view())
+    for c in zeros
+        if c < tau.len() then assert(tau[c] == T.zero(), s"τ $c of a zero column is not zero at $m x $n")
+        for i in 0..<min(c + 1, m)
+            assert(f[i + c * ld] == T.zero(), s"R's column $c is not zero at $m x $n")
+    check_qr_of(a.view(), m, n, ld, seed)
+
+@test("zero columns: the first, inside the first block, at a block edge, past it, and the last, f64 and f32")
+qr_zero_columns()
+    val first: [1]usize = [0]
+    check_qr_zero_columns[f64](10, 10, first[..], 1)
+    val inside: [2]usize = [3, 4]
+    check_qr_zero_columns[f32](20, 12, inside[..], 2)
+    val edges: [4]usize = [0, 31, 32, 99]
+    check_qr_zero_columns[f64](130, 100, edges[..], 3)
+    val wide: [3]usize = [33, 64, 149]
+    check_qr_zero_columns[f32](100, 150, wide[..], 4)
+
+/** A random `m` x `n` matrix of rank `rank`, B C for B `m` x `rank` and C `rank` x `n`. */
+private check_qr_rank[T: Real](m: usize, n: usize, rank: usize, seed: u64)
+    var g = Stream(seed)
+    val b = random[T](&g, m, rank, m, T.zero())
+    val c = random[T](&g, rank, n, rank, T.zero())
+    val ld = m + 2
+    val a: Buf[T] = buf_filled(ld * n, T.nan())
+    for j in 0..<n
+        for i in 0..<m
+            var s = T.zero()
+            for p in 0..<rank do s = s + b[i + p * m] * c[p + j * rank]
+            a[i + j * ld] = s
+    check_qr_of(a.view(), m, n, ld, seed)
+
+@test("rank-deficient matrices factor within LAPACK's threshold, unblocked and blocked, tall and wide")
+qr_rank_deficient()
+    check_qr_rank[f64](20, 20, 7, 1)
+    check_qr_rank[f64](150, 100, 40, 2)
+    check_qr_rank[f32](100, 150, 1, 3)
+    check_qr_rank[f64](129, 129, 64, 4)
+
+/** A random 3 x 2 matrix scaled by `scale`, checked in full. */
+private check_scaled[T: Real](scale: T, seed: u64)
+    var g = Stream(seed)
+    val a = random[T](&g, 3, 2, 4, T.nan())
+    for j in 0..<2
+        for i in 0..<3 do a[i + j * 4] = a[i + j * 4] * scale
+    check_qr_of(a.view(), 3, 2, 4, seed)
+
+@test("columns too small for a safe reciprocal are scaled up in larfg, and huge ones do not overflow")
+qr_scaling()
+    check_scaled[f64](f64.safe_min() / f64.epsilon() / 16, 1)
+    check_scaled[f32](f32.safe_min() / f32.epsilon() / 16, 2)
+    check_scaled[f64](f64.safe_max() / 1024, 3)
+    check_scaled[f32](f32.safe_max() / 1024, 4)
+
+@test("a NaN in A spreads into R rather than trapping, unblocked and blocked")
+qr_nan()
+    val orders: [2]usize = [4, 80]
+    for n in orders
+        var g = Stream(u64(n))
+        val a = random[f64](&g, n, n, n, 0)
+        a[0] = f64.nan()
+        val tau: Buf[f64] = buf_filled(n, 0)
+        factor_qr(matrix_mut(a.view(), n, n, n), tau.view())
+        assert(a[0].is_nan() && a[n * n - 1].is_nan())
+
+// --- Empty input ------------------------------------------------------------------------------------
+
+@test("empty matrices factor, form and apply as nothing, and need no workspace")
+qr_empty()
+    var s: [4]f64 = [9, 9, 9, 9]
+    var tau: [1]f64 = [9]
+    val none = QrWork(s[0..<0], work0())
+    geqrf(matrix_mut(s[0..<0], 0, 3, 1), tau[..], none)
+    geqrf(matrix_mut(s[0..<0], 3, 0, 3), tau[..], none)
+    geqr2(matrix_mut(s[0..<0], 0, 0, 1), tau[..], s[0..<0])
+    orgqr(matrix_mut(s[0..<0], 0, 0, 1), tau[0..<0], none)
+    org2r(matrix_mut(s[0..<0], 0, 0, 1), tau[0..<0], s[0..<0])
+    ormqr(Side.Left, Transpose.NoTrans, matrix(s[0..<0], 0, 0, 1), tau[0..<0], matrix_mut(s[0..<0], 0, 2, 1), none)
+    ormqr(Side.Right, Transpose.Trans, matrix(s[0..<0], 0, 0, 1), tau[0..<0], matrix_mut(s[0..<0], 3, 0, 3), none)
+    // No reflectors at all: C is untouched.
+    ormqr(Side.Left, Transpose.Trans, matrix(s[..], 2, 0, 2), tau[0..<0], matrix_mut(s[..], 2, 2, 2), none)
+    for v in s
+        assert(v == 9)
+    assert(tau[0] == 9)
+    val len = geqrf_work_len[f64](0, 5)
+    assert(len.block == 0 && len.gemm.a == 0 && len.gemm.b == 0)
+    // orgqr with no reflectors is the identity.
+    var q: [4]f64 = [7, 7, 7, 7]
+    orgqr(matrix_mut(q[..], 2, 2, 2), tau[0..<0], none)
+    assert(q[0] == 1 && q[1] == 0 && q[2] == 0 && q[3] == 1)
+
+// --- Views as input ---------------------------------------------------------------------------------
+
+@test("a blocked factorisation of a block of a larger matrix agrees bit for bit with the same matrix on its own, and touches nothing around it")
+qr_block_view()
+    val m: usize = 140
+    val n: usize = 110
+    var g = Stream(11)
+    val alone = random[f64](&g, m, n, m, 0)
+    val ld: usize = 170
+    val big: Buf[f64] = buf_filled(ld * (n + 5), f64.nan())
+    for j in 0..<n
+        for i in 0..<m
+            big[(i + 20) + (j + 5) * ld] = alone[i + j * m]
+    val t1: Buf[f64] = buf_filled(n, 0)
+    val t2: Buf[f64] = buf_filled(n, 0)
+    factor_qr(matrix_mut(alone.view(), m, n, m), t1.view())
+    val view = matrix_mut(big.view(), ld, n + 5, ld).block(20, 5, m, n)
+    factor_qr(view, t2.view())
+    for j in 0..<n
+        assert(t1[j] == t2[j])
+        for i in 0..<m
+            assert(alone[i + j * m] == big[(i + 20) + (j + 5) * ld])
+    for j in 0..<n + 5
+        for i in 0..<ld
+            if !(i >= 20 && i < 20 + m && j >= 5 && j < 5 + n) then assert(big[i + j * ld].is_nan(), "geqrf wrote outside its block")
+    // orgqr and ormqr on blocks agree bit for bit too.
+    val q1 = reflectors(matrix(alone.view(), m, n, m), n, n, m)
+    form_qr(matrix_mut(q1.view(), m, n, m), t1.view())
+    form_qr(view, t2.view())
+    for j in 0..<n
+        for i in 0..<m
+            assert(q1[i + j * m] == big[(i + 20) + (j + 5) * ld])
+
+@test("geqrf, orgqr and ormqr on row-major views, the transpose of column-major storage, agree with the column-major ones")
+qr_row_major_view()
+    val m: usize = 90
+    val n: usize = 70
+    var g = Stream(5)
+    val a = random[f64](&g, m, n, m, 0)
+    // The same matrix stored row-major: element (i, j) at j + i n.
+    val r: Buf[f64] = buf_filled(m * n, 0)
+    for j in 0..<n
+        for i in 0..<m do r[j + i * n] = a[i + j * m]
+    val t1: Buf[f64] = buf_filled(n, 0)
+    val t2: Buf[f64] = buf_filled(n, 0)
+    val f = copy_of(a.view())
+    factor_qr(matrix_mut(f.view(), m, n, m), t1.view())
+    val rv = matrix_mut(r.view(), n, m, n).t()
+    factor_qr(rv, t2.view())
+    var most = 0.0
+    for v in f.view()
+        if v.abs() > most then most = v.abs()
+    val tol = 64.0 * f64(m) * f64.epsilon() * most
+    for j in 0..<n
+        assert((t1[j] - t2[j]).abs() <= 64.0 * f64(m) * f64.epsilon())
+        for i in 0..<m
+            assert((f[i + j * m] - rv.at(i, j)).abs() <= tol, "a row-major geqrf differs")
+    // Q from the row-major reflectors, applied to a row-major C, against the column-major Q C.
+    val c = random[f64](&g, m, 4, m, 0)
+    val cr: Buf[f64] = buf_filled(m * 4, 0)
+    for j in 0..<4
+        for i in 0..<m do cr[j + i * 4] = c[i + j * m]
+    apply_qr(Side.Left, Transpose.NoTrans, matrix(f.view(), m, n, m), t1.view(), matrix_mut(c.view(), m, 4, m))
+    val crv = matrix_mut(cr.view(), 4, m, 4).t()
+    apply_qr(Side.Left, Transpose.NoTrans, rv.as_view(), t2.view(), crv)
+    for j in 0..<4
+        for i in 0..<m
+            assert((c[i + j * m] - crv.at(i, j)).abs() <= 1e-12, "a row-major ormqr differs")
+    form_qr(rv, t2.view())
+    assert(orth_ratio(rv.as_view()) < 30.0)
+
+@test("ormqr takes the whole of a wide geqrf's A, reading only the reflectors' columns")
+qr_ormqr_wide_a()
+    val m: usize = 40
+    val n: usize = 90
+    var g = Stream(3)
+    val a = random[f64](&g, m, n, m, 0)
+    val tau: Buf[f64] = buf_filled(m, 0)
+    factor_qr(matrix_mut(a.view(), m, n, m), tau.view())
+    // QᵀA = R: the columns of A itself, multiplied by Qᵀ, come out as R.
+    var g2 = Stream(3)
+    val orig = random[f64](&g2, m, n, m, 0)
+    apply_qr(Side.Left, Transpose.Trans, matrix(a.view(), m, n, m), tau.view(), matrix_mut(orig.view(), m, n, m))
+    for j in 0..<n
+        for i in 0..<m
+            val want = if i <= j then a[i + j * m] else 0
+            assert((orig[i + j * m] - want).abs() <= 1e-13, "Qᵀ A is not R")
+
+// --- The workspace, and what traps ----------------------------------------------------------------
+
+@test("the workspace is one vector within a block, nothing from gemm, and enough for every update past it")
+qr_work_len()
+    val small = geqrf_work_len[f64](64, 32)
+    assert(small.block == 32 && small.gemm.a == 0 && small.gemm.b == 0)
+    val big = geqrf_work_len[f64](200, 100)
+    assert(big.block >= 32 * 32 + 100 * 32 && big.gemm.a > 0 && big.gemm.b > 0)
+    val left = ormqr_work_len[f64](Side.Left, 100, 7, 50)
+    val right = ormqr_work_len[f64](Side.Right, 7, 100, 50)
+    assert(left.block == right.block && left.gemm.a == right.gemm.a && left.gemm.b == right.gemm.b)
+    val none = orgqr_work_len[f64](10, 10, 0)
+    assert(none.block == 0)
+
+@test("geqrf traps on a tau shorter than min(m, n)", should_trap)
+qr_short_tau()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var tau: [1]f64
+    geqrf(matrix_mut(s[..], 3, 2, 3), tau[..], QrWork(s[..], work0()))
+
+@test("geqr2 traps on a tau shorter than min(m, n)", should_trap)
+qr_geqr2_short_tau()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var w: [2]f64
+    geqr2(matrix_mut(s[..], 2, 3, 2), w[0..<1], w[..])
+
+@test("geqrf traps on a block workspace shorter than geqrf_work_len says", should_trap)
+qr_short_block()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var tau: [2]f64
+    var w: [1]f64
+    geqrf(matrix_mut(s[..], 3, 2, 3), tau[..], QrWork(w[..], work0()))
+
+@test("geqrf traps on gemm buffers shorter than geqrf_work_len says", should_trap)
+qr_short_gemm()
+    var g = Stream(2)
+    val a = random[f64](&g, 100, 100, 100, 0)
+    val tau: Buf[f64] = buf_filled(100, 0)
+    val block: Buf[f64] = buf_filled(geqrf_work_len[f64](100, 100).block, 0)
+    geqrf(matrix_mut(a.view(), 100, 100, 100), tau.view(), QrWork(block.view(), work0()))
+
+@test("geqr2 traps on a work vector shorter than A's columns", should_trap)
+qr_geqr2_short_work()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var tau: [2]f64
+    var w: [1]f64
+    geqr2(matrix_mut(s[..], 3, 2, 3), tau[..], w[..])
+
+@test("orgqr traps on a Q with more columns than rows", should_trap)
+qr_orgqr_wide()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var tau: [1]f64
+    orgqr(matrix_mut(s[..], 2, 3, 2), tau[..], QrWork(s[..], work0()))
+
+@test("orgqr traps on more reflectors than Q has columns", should_trap)
+qr_orgqr_too_many()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var tau: [3]f64
+    orgqr(matrix_mut(s[..], 3, 2, 3), tau[..], QrWork(s[..], work0()))
+
+@test("orgqr traps on a workspace shorter than orgqr_work_len says", should_trap)
+qr_orgqr_short_work()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var tau: [2]f64
+    orgqr(matrix_mut(s[..], 3, 2, 3), tau[..], QrWork(s[0..<1], work0()))
+
+@test("org2r traps on more reflectors than Q has columns", should_trap)
+qr_org2r_too_many()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var tau: [3]f64
+    org2r(matrix_mut(s[..], 3, 2, 3), tau[..], s[..])
+
+@test("org2r traps on a Q with more columns than rows", should_trap)
+qr_org2r_wide()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var tau: [1]f64
+    org2r(matrix_mut(s[..], 2, 3, 2), tau[..], s[..])
+
+@test("ormqr from the left traps on reflectors not as long as C's rows", should_trap)
+qr_ormqr_left_rows()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var c: [4]f64
+    var tau: [1]f64
+    ormqr(Side.Left, Transpose.NoTrans, matrix(s[..], 3, 2, 3), tau[..], matrix_mut(c[..], 2, 2, 2), QrWork(s[..], work0()))
+
+@test("ormqr from the right traps on reflectors not as long as C's columns", should_trap)
+qr_ormqr_right_cols()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var c: [6]f64
+    var tau: [1]f64
+    ormqr(Side.Right, Transpose.Trans, matrix(s[..], 3, 2, 3), tau[..], matrix_mut(c[..], 3, 2, 3), QrWork(s[..], work0()))
+
+@test("ormqr traps on more reflectors than A has columns", should_trap)
+qr_ormqr_too_many()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var c: [6]f64
+    var tau: [3]f64
+    ormqr(Side.Left, Transpose.NoTrans, matrix(s[..], 3, 2, 3), tau[..], matrix_mut(c[..], 3, 2, 3), QrWork(s[..], work0()))
+
+@test("ormqr traps on a workspace shorter than ormqr_work_len says", should_trap)
+qr_ormqr_short_work()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var c: [6]f64
+    var tau: [2]f64
+    ormqr(Side.Left, Transpose.NoTrans, matrix(s[..], 3, 2, 3), tau[..], matrix_mut(c[..], 3, 2, 3), QrWork(s[0..<1], work0()))

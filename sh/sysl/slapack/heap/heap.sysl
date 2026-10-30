@@ -1,7 +1,7 @@
 module sh.sysl.slapack.heap
 
-import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, Uplo}
-import sh.sysl.slapack.{Error, Transpose, getrf, getrf_work_len, getrs, getrs_work_len, potrf, potrf_work_len, potrs, potrs_work_len}
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, Side, Uplo}
+import sh.sysl.slapack.{Error, Transpose, QrWork, getrf, getrf_work_len, getrs, getrs_work_len, potrf, potrf_work_len, potrs, potrs_work_len, geqrf, geqrf_work_len, orgqr, orgqr_work_len, ormqr, ormqr_work_len}
 import sysl.buf.{Buf, buf_filled}
 
 // The routines of sh.sysl.slapack that need scratch storage, in the form that allocates it per call.
@@ -35,3 +35,27 @@ potrs_alloc[T: Real](uplo: Uplo, f: Matrix[T], b: MatrixMut[T])
     val pa: Buf[T] = buf_filled(len.a, T.zero())
     val pb: Buf[T] = buf_filled(len.b, T.zero())
     potrs(uplo, f, b, GemmWork(pa.view(), pb.view()))
+
+/** `geqrf`, with its workspace allocated for the call and freed after it. */
+geqrf_alloc[T: Real](a: MatrixMut[T], tau: []T)
+    val len = geqrf_work_len[T](a.rows, a.cols)
+    val block: Buf[T] = buf_filled(len.block, T.zero())
+    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    geqrf(a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+
+/** `orgqr`, with its workspace allocated for the call and freed after it. */
+orgqr_alloc[T: Real](a: MatrixMut[T], tau: []const T)
+    val len = orgqr_work_len[T](a.rows, a.cols, tau.len)
+    val block: Buf[T] = buf_filled(len.block, T.zero())
+    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    orgqr(a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+
+/** `ormqr`, with its workspace allocated for the call and freed after it. */
+ormqr_alloc[T: Real](side: Side, trans: Transpose, a: Matrix[T], tau: []const T, c: MatrixMut[T])
+    val len = ormqr_work_len[T](side, c.rows, c.cols, tau.len)
+    val block: Buf[T] = buf_filled(len.block, T.zero())
+    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    ormqr(side, trans, a, tau, c, QrWork(block.view(), GemmWork(pa.view(), pb.view())))

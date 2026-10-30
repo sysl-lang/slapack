@@ -13,7 +13,7 @@ float edge cases — and a gap it finds is a gap to fix in sysl.
 |---|---|---|
 | LU | `getrf` (blocked), `getf2` (its unblocked panel), `getrs`, `laswp` | done, f32 and f64 |
 | Cholesky | `potrf` (blocked), `potf2` (its unblocked kernel), `potrs` | done, f32 and f64 |
-| QR | `geqrf`, `orgqr` (with `geqr2`, `larfg`, `larft`, `larfb`) | planned |
+| QR | `geqrf` (blocked), `geqr2` (its unblocked panel), `orgqr`, `org2r`, `ormqr`, `larfg` | done, f32 and f64 |
 | symmetric eigenproblem | `syev` (`sytrd`, `orgtr`, `steqr`/`sterf`) | planned |
 | singular value decomposition | `gesvd` (`gebrd`, `orgbr`, `bdsqr`) | planned |
 
@@ -39,13 +39,23 @@ potrf(Uplo.Lower, a, work)                 // Result[unit, Error]: A = L Lᵀ in
 potrf(Uplo.Upper, a, work)                 // A = Uᵀ U in its upper triangle
 potrs(Uplo.Lower, l, b, work)              // b := A⁻¹ b, with potrf's factor
 potf2(uplo, a)                             // the unblocked factorisation
+geqrf(a, tau, qr_work)                     // A = QR in place: R above the diagonal, reflectors below
+geqr2(a, tau, work)                        // the unblocked factorisation
+orgqr(q, tau, qr_work)                     // Q's first q.cols columns from tau.len reflectors in q
+org2r(q, tau, work)                        // the unblocked form
+ormqr(Side.Left, Transpose.Trans, a, tau, c, qr_work)  // c := Qᵀ c; Right gives c Q or c Qᵀ
+larfg(alpha, x)                            // (beta, tau): the reflector taking (alpha, x) to (beta, 0)
 ```
 
 **Workspace is the caller's, as in sblas.** `getrf` and `getrs` take sblas's `GemmWork` packing buffers
 for the `trsm` and `gemm` they call, sized by `getrf_work_len[T](m, n)` and `getrs_work_len[T](n,
 nrhs)` (and `potrf_work_len[T](n)`, `potrs_work_len[T](n, nrhs)`); the core module is `@no_alloc` and
-builds for a board with no heap. `sh.sysl.slapack.heap` holds `getrf_alloc`, `getrs_alloc`,
-`potrf_alloc` and `potrs_alloc`, which allocate the buffers per call.
+builds for a board with no heap. The QR routines need a block reflector's factor and product besides
+the packing buffers, so they take a `QrWork(block, gemm)`, sized by `geqrf_work_len[T](m, n)`,
+`orgqr_work_len[T](m, n, k)` and `ormqr_work_len[T](side, m, n, k)` as a `QrWorkLen(block, gemm)`;
+the unblocked `geqr2` and `org2r` take one vector of `a.cols`. `sh.sysl.slapack.heap` holds
+`getrf_alloc`, `getrs_alloc`, `potrf_alloc`, `potrs_alloc`, `geqrf_alloc`, `orgqr_alloc` and
+`ormqr_alloc`, which allocate the buffers per call.
 
 **The triangle is an `Uplo`, sblas's own enum.** Unlike `getrs`'s `Transpose`, it could have been a
 view: the upper triangle of A is the lower triangle of `a.t()`, and the upper factor is the transposed
@@ -80,6 +90,12 @@ positive definite, an iteration that did not converge). slapack separates them.
 
 `Error` is an enum so that the families still to come add their own variants (`NotPositiveDefinite`
 for `potrf`, `NoConvergence` for `syev` and `gesvd`) rather than a second error type per routine.
+
+**The QR routines answer nothing.** Every matrix has a QR factorisation, so `dgeqrf`'s `info` is only
+ever about the arguments: here those trap — a `tau` shorter than `min(m, n)`, a Q with more columns
+than rows or more reflectors than columns, reflectors not as long as C's side, a short workspace —
+and `geqrf`, `orgqr` and `ormqr` return `unit`. A zero or dependent column gives a zero on R's
+diagonal, which is the caller's to look at, and a NaN spreads through R as it does in LAPACK.
 
 ## The LU factorisation
 
@@ -132,6 +148,49 @@ right of `j` is touched. Unlike `getrf` there is nothing useful to finish.
 `potrs` solves with `L` then `Lᵀ`, two `trsm`s over the factor (`Upper`'s `U` read as `Uᵀ`, through
 `t()`). Like LAPACK's it does not check the diagonal.
 
+## The QR factorisation
+
+`geqrf` is LAPACK's blocked Householder algorithm with a block of `qr_block = 32` reflectors (LAPACK's
+default `nb` for `geqrf`, `orgqr` and `ormqr`); a matrix whose shorter side is within one block is
+factored by `geqr2` alone. LAPACK also keeps a crossover (`nx = 128`) below which it stays unblocked
+for speed; slapack blocks from the first column past a block, so that orders 33 to 64 already exercise
+the blocked path. For each block `i..<i + ib`:
+
+1. `geqr2` factors the panel `A(i:m, i:i+ib)`: for each column, `larfg` makes the reflector that
+   zeroes it below the diagonal (`nrm2`, `scal`), and `larf` applies it to the columns right of it in
+   the panel — `w = Cᵀ v` by `gemv`, `C −= τ v wᵀ` by `ger`;
+2. `larft` gathers the panel's reflectors into one, H(i) … H(i+ib−1) = I − V T Vᵀ with T upper
+   triangular, a `gemv` and a triangular product per column;
+3. `larfb` applies its transpose to the trailing columns: W = Cᵀ V T, then C −= V Wᵀ — two `gemm`s
+   over the rows below the block, and triangular products with V's unit upper block and with T.
+
+**A reflector's leading one is implicit everywhere.** LAPACK's `dlarf` reads v from A with its first
+element temporarily set to one (`dgeqr2` saves `A(i, i)`, writes 1, calls `dlarf`, and restores it).
+slapack's `larf` takes the tail of v and treats the one itself, so A is never written as scratch, and
+`ormqr` can take its reflectors as a read-only `Matrix`, as it is given them. `larft` and `larfb`
+likewise never read the diagonal of the reflectors' block, which holds R.
+
+**sblas has no `trmm`**, which `dlarfb` calls three times. The products are `k` x `k` triangles
+(`k ≤ 32`) against a `cols` x `k` W, so slapack's private `trmm_right` forms each column of W A with
+one `gemv` over the columns of W it combines, walking away from them so that each is still unwritten
+when read. That is `cols k²` flops beside the `gemm`s' `rows cols k`: small, and the step a `trmm`
+in sblas would take over.
+
+**One side, as one triangle in Cholesky.** Every reflection is applied from the left. C Q is (Qᵀ Cᵀ)ᵀ,
+so `ormqr(Side.Right, trans, …, c)` is the left-hand product on `c.t()` with the transpose flipped;
+`Side` stays in the signature because LAPACK's callers think in it.
+
+**k is `tau.len`.** LAPACK's `dorgqr` and `dormqr` take `k` beside `tau`; here the slice carries it, so
+`orgqr(q, tau[0..<k], work)` forms Q from the first `k` reflectors. `orgqr`'s `q` is `m` x `n` with
+`k ≤ n ≤ m`: `n = k` is the thin Q of a tall A, `n = m` the whole of it. `ormqr`'s `a` may be wider
+than `k` — the whole of a wide `geqrf`'s A — since only the first `k` columns below the diagonal are
+read. `orgqr` mirrors `dorgqr`: the columns past `k` start as the identity's, then each block, last
+first, applies its reflector to the columns right of it and forms its own with `org2r`.
+
+`ormqr` applies the blocks in the order the product needs — Qᵀ C from the first block, Q C from the
+last — each through `larft` and `larfb` with `trans`; within one block's width it is `larf` per
+reflector, as `dorm2r`.
+
 ## Oracles
 
 `sysl test .` checks the routines against their definitions: systems factored and solved by hand,
@@ -150,6 +209,21 @@ column, at the next block's first, later, at the very last and at column 0, each
 leaving the columns before it bit for bit as the full factorisation has them; semidefinite, negative
 and NaN diagonals; the two triangles' factors against each other; views; and the traps.
 
+QR is checked by LAPACK's `dqrt01`–`dqrt03` measures: ‖A − Q R‖ / (max(m, n) ‖A‖ ε), ‖I − Qᵀ Q‖ /
+(m ε) for the whole Q and, for a tall A, the thin one, and each of `ormqr`'s four products against
+the whole Q formed explicitly, ‖op(Q) C − ormqr‖ / (max(m, p) ‖C‖ ε) — all under 30, at every square
+order 1 to 64, past the block (65, 100, 128, 129, 193, 200), every shape up to 12 x 12, and tall and
+wide (150 x 70, 200 x 65, 130 x 3, 300 x 100, 97 x 33, 64 x 33 and their transposes). Every workspace
+is filled with NaN and every matrix sits in NaN padding, `tau` with a spare NaN element, and the
+reflectors handed to `orgqr` have NaN where R and the columns past `k` were, so a read of anything a
+routine should not read shows. Exactly: a 2 x 2 worked by hand (R, τ, Q and both sides of `ormqr`);
+`larfg` on a zero tail and by hand; an upper triangular A, whose τ are all zero and which comes back
+bit for bit; a zero matrix, whose Q is the identity; zero columns at the first, inside a block, at
+and past a block edge, and last, each with τ zero and R's column zero; rank-deficient products B C;
+columns small enough that `larfg` scales them and big enough to overflow a sum of squares; a NaN; a
+block of a larger matrix, bit for bit with the same matrix alone and nothing around it touched; a
+row-major view; `ormqr` reading the whole of a wide A; and a trap for every call that is wrong.
+
 `oracle/`, a project of its own so that the package links nothing, factors the same random matrices
 with the platform's `dgetrf` and `sgetrf` through the [lapack](https://github.com/sysl-lang/lapack)
 binding (Accelerate on macOS) and requires the same pivots, the same first zero pivot, and every factor
@@ -158,6 +232,16 @@ triangle — the same failing column, and every element of the factor within 64 
 slapack's left the other triangle as it was. The platform's is not held to that: **Accelerate's
 `potrf` writes the triangle LAPACK documents as not referenced**, from order 33 on (observed on macOS,
 sysl 0.8.3), so a caller of the platform's that keeps data there loses it.
+
+For QR the oracle runs the platform's `dgeqrf` and `sgeqrf` (the binding's `qr_inplace`) on random
+matrices of every square order 1 to 64, past the block (65, 100, 128, 129, 193, 200) and tall and wide
+(150 x 70, 200 x 65, 130 x 3, 7 x 3 and their transposes), and on zero columns either side of a block
+edge. R is compared row by row up to the sign of its diagonal — the sign `larfg` gives beta is a
+convention, and a reflector that takes a column to −beta is as good — and where the signs agree τ and
+the reflector are compared too, where they differ τ + τ' = 2; all within 64 max(m, n) ε. Accelerate
+and slapack choose the same sign on every row of every one of these matrices (sysl 0.8.3, macOS), so
+the oracle requires it: no row is flipped, and R, τ and the reflectors agree outright. A `larfg` with
+the sign reversed turns all three oracle tests red.
 
 ## Gaps found so far
 
@@ -180,6 +264,11 @@ sysl 0.8.3), so a caller of the platform's that keeps data there loses it.
   question for the user is whether `Float` should require `Display` (and `Debug`).
 
 ## Notes
+
+- **The tests' 1-norm answers NaN for a NaN.** `norm1` once kept the largest column sum by `sum >
+  most`, which is false for a NaN, so a NaN column read as zero and a ratio built on it passed. The
+  QR mutation pass found it: an `orgqr` that left NaN in Q passed every residual test. It now answers
+  the NaN, as `dlange` does, and every family's ratios are held to it.
 
 - **An integer reaches a generic float as `T(k)`** (`reference/generics.md § Converting through a
   parameter`). sblas's `tests_trsm.sysl` builds `k` from ones, its comment saying `Real` has no

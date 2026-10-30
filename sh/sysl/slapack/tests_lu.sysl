@@ -47,13 +47,16 @@ private[slapack] random[T: Real](g: *Stream, m: usize, n: usize, ld: usize, pad:
             s[i + j * ld] = g.next[T]()
     s
 
-/** The 1-norm: the largest column sum of magnitudes. */
+/** The 1-norm: the largest column sum of magnitudes. A NaN anywhere answers NaN, as LAPACK's `dlange`
+ * does, so that a ratio built on it fails its threshold instead of reading the NaN column as zero.
+ */
 private[slapack] norm1[T: Real](rows: usize, cols: usize, at: (usize, usize) -> T) -> T
     var most = T.zero()
     for j in 0..<cols
         var sum = T.zero()
         for i in 0..<rows
             sum = sum + at(i, j).abs()
+        if sum.is_nan() then return sum
         if sum > most then most = sum
     most
 

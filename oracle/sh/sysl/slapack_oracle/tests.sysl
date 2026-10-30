@@ -119,6 +119,68 @@ oracle_potrf_f64()
 oracle_potrf_f32()
     sweep_chol[f32]()
 
+/** Factors one random `m` x `n` matrix, with `zeros` columns zeroed, by slapack's geqrf and the
+ * platform's, and checks that they agree to within `64 · max(m, n) · ε`: each row of R up to the sign
+ * of its diagonal — a reflector may take a column to `−beta` instead of `beta` — and, where the signs
+ * agree, τ and the reflector, or, where they do not, τ + τ' = 2. Answers how many rows' signs differ.
+ */
+private agree_qr[T: Real + Scalar](m: usize, n: usize, zeros: []const usize, seed: u64) -> usize
+    var g = Stream(seed)
+    val a: Buf[T] = buf_filled(m * n, T.zero())
+    for i in 0..<a.len() do a[i] = g.next[T]()
+    for c in zeros
+        for i in 0..<m do a[i + c * m] = T.zero()
+    val mine = slapack_qr(a.view(), m, n)
+    val theirs = platform_qr(a.view(), m, n)
+    var most = T.zero()
+    for i in 0..<a.len()
+        if theirs.factors[i].abs() > most then most = theirs.factors[i].abs()
+    val eps = T(64 * (if m > n then m else n)) * T.epsilon()
+    val tol = eps * most
+    var flipped: usize = 0
+    for i in 0..<mine.tau.len()
+        val (r, s) = (mine.factors[i + i * m], theirs.factors[i + i * m])
+        val same = (r < T.zero()) == (s < T.zero())
+        if !same then flipped += 1
+        val sign = if same then T.one() else -T.one()
+        for j in i..<n
+            val d = (mine.factors[i + j * m] - sign * theirs.factors[i + j * m]).abs()
+            assert(d <= tol, s"R($i, $j) differs by ${f64(d)} at $m x $n")
+        val (t, u) = (mine.tau[i], theirs.tau[i])
+        if same
+            assert((t - u).abs() <= eps, s"τ $i is ${f64(t)} against ${f64(u)} at $m x $n")
+            for p in i + 1..<m
+                val d = (mine.factors[p + i * m] - theirs.factors[p + i * m]).abs()
+                assert(d <= eps, s"reflector $i differs by ${f64(d)} in row $p at $m x $n")
+        else
+            assert((t + u - T(2)).abs() <= eps, s"τ $i is ${f64(t)} against ${f64(u)}, flipped, at $m x $n")
+    flipped
+
+private sweep_qr[T: Real + Scalar]()
+    val none: [0]usize = []
+    var flipped: usize = 0
+    for n in 1..64
+        flipped += agree_qr[T](n, n, none[..], u64(n))
+    val shapes: [14](usize, usize) = [(65, 65), (100, 100), (128, 128), (129, 129), (193, 193), (200, 200), (150, 70), (70, 150), (200, 65), (65, 200), (130, 3), (3, 130), (7, 3), (3, 7)]
+    for (m, n) in shapes
+        flipped += agree_qr[T](m, n, none[..], u64(m * 1000 + n))
+    assert(flipped == 0, s"$flipped rows of R have the opposite sign to the platform's")
+
+@test("geqrf agrees with the platform's dgeqrf: R, τ and the reflectors, square orders 1 to 64 and blocked, tall and wide shapes")
+oracle_geqrf_f64()
+    sweep_qr[f64]()
+
+@test("geqrf agrees with the platform's sgeqrf: R, τ and the reflectors, square orders 1 to 64 and blocked, tall and wide shapes")
+oracle_geqrf_f32()
+    sweep_qr[f32]()
+
+@test("geqrf agrees with the platform's on zero columns: τ zero where the platform's is, and R's column zero")
+oracle_geqrf_zero_columns()
+    val cols: [4]usize = [0, 31, 32, 99]
+    _ = agree_qr[f64](130, 100, cols[..], 1)
+    val first: [1]usize = [0]
+    _ = agree_qr[f32](20, 20, first[..], 2)
+
 @test("potrf names the same failing minor as the platform's, within a block and past one")
 oracle_potrf_not_pd()
     for uplo in [Uplo.Lower, Uplo.Upper]
