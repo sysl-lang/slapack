@@ -17,7 +17,7 @@ trademark holders.*
 | LU | `getrf`, `getrs` (and `getf2`, `laswp`) | done, f32 and f64 |
 | Cholesky | `potrf`, `potrs` (and `potf2`) | done, f32 and f64 |
 | QR | `geqrf`, `orgqr`, `ormqr` (and `geqr2`, `org2r`, `larfg`) | done, f32 and f64 |
-| symmetric eigenproblem | `syev` | planned |
+| symmetric eigenproblem | `syev` (and `sytrd`, `orgtr`, `steqr`, `sterf`) | done, f32 and f64 |
 | singular value decomposition | `gesvd` | planned |
 
 ## Use
@@ -91,15 +91,38 @@ print(c, d, b[2].abs())                                 // 0.8333333333333335 2.
 
 That is c = 5/6, d = 5/2, and a residual of 1/√6.
 
+The eigenvalues of a symmetric matrix come back ascending, read from one triangle; with
+`Eigen.Vectors` the matrix is overwritten by the orthonormal eigenvectors, column `j` that of `w[j]`:
+
+```sysl
+import sh.sysl.sblas.{Uplo, matrix_mut}
+import sh.sysl.slapack.Eigen
+import sh.sysl.slapack.heap.syev_alloc
+
+var a: [9]f64 = [2, 1, 0, 0, 2, 1, 0, 0, 2]           // the lower triangle of [2 1 0; 1 2 1; 0 1 2]
+var w: [3]f64
+print(syev_alloc(Eigen.Vectors, Uplo.Lower, matrix_mut(a[..], 3, 3, 3), w[..]))  // Ok(())
+print(w)                                               // [0.585786437626905, 1.9999999999999998, 3.414213562373095]
+print(a[0..<3])                                        // [-0.5, 0.7071067811865475, -0.49999999999999983]
+
+var b: [9]f64 = [2, 0, 0, 1, 2, 0, 0, 1, 2]           // the upper triangle of the same matrix
+print(syev_alloc(Eigen.Values, Uplo.Upper, matrix_mut(b[..], 3, 3, 3), w[..]), w)  // Ok(()) and the same w
+```
+
+That is 2 − √2, 2 and 2 + √2, the first with the eigenvector (1, −√2, 1)/2 up to its sign. A
+non-converging iteration — which a NaN in the matrix gives — is `Err(Error.NoConvergence(k))`.
+
 The routines themselves take sblas's `GemmWork` packing buffers, sized by `getrf_work_len`,
 `getrs_work_len`, `potrf_work_len` and `potrs_work_len` — the QR ones a `QrWork`, sized by
-`geqrf_work_len`, `orgqr_work_len` and `ormqr_work_len` — and allocate nothing; `sh.sysl.slapack.heap`
+`geqrf_work_len`, `orgqr_work_len` and `ormqr_work_len`, and `syev` a `SyevWork`, sized by
+`syev_work_len` — and allocate nothing; `sh.sysl.slapack.heap`
 holds the forms that allocate them per call. The design, and what the language made easy or hard, is in [DESIGN.md](DESIGN.md).
 
 ## Tests
 
 `sysl test .` runs the package's tests against the routines' definitions — hand-factored systems, and
 LAPACK's own residual measures on random matrices of every order from 1 to 64 and past the panel width,
-square, tall and wide, symmetric positive definite from either triangle, and Q's orthogonality and
-products — and `oracle/` compares the factors with the platform's `dgetrf`, `sgetrf`, `dpotrf`,
-`spotrf`, `dgeqrf` and `sgeqrf` through the `lapack` binding.
+square, tall and wide, symmetric positive definite from either triangle, Q's orthogonality and
+products, and the eigensystems' residuals and orthogonality — and `oracle/` compares the factors with
+the platform's `dgetrf`, `sgetrf`, `dpotrf`, `spotrf`, `dgeqrf` and `sgeqrf` through the `lapack`
+binding, and the eigenvalues and eigenvectors with its `dsyev` and `ssyev`.

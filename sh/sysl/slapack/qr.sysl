@@ -61,7 +61,7 @@ private split[T](block: []T, k: usize, cols: usize) -> (MatrixMut[T], MatrixMut[
 /** The square root of x² + y², without the overflow or underflow of squaring: LAPACK's `lapy2`. A NaN
  * in either answers it.
  */
-private lapy2[T: Real](x: T, y: T) -> T
+private[slapack] lapy2[T: Real](x: T, y: T) -> T
     if x.is_nan() then return x
     if y.is_nan() then return y
     val (xa, ya) = (x.abs(), y.abs())

@@ -43,7 +43,7 @@ private unblocked[T: Real](a: MatrixMut[T], k: usize) -> Option[usize]
     None
 
 /** The view of `a` whose lower triangle holds the triangle `uplo` names. */
-private lower_of[T](uplo: Uplo, a: MatrixMut[T]) -> MatrixMut[T] = if uplo == Uplo.Upper then a.t() else a
+private[slapack] lower_of[T](uplo: Uplo, a: MatrixMut[T]) -> MatrixMut[T] = if uplo == Uplo.Upper then a.t() else a
 
 /** LAPACK's `potf2`: the Cholesky factorisation of a symmetric positive definite A, unblocked.
  *

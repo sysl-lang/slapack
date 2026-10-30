@@ -2,7 +2,7 @@ module sh.sysl.slapack.heap
 @tests
 
 import sh.sysl.sblas.{Side, Uplo, matrix, matrix_mut}
-import sh.sysl.slapack.{Error, Transpose}
+import sh.sysl.slapack.{Error, Transpose, Eigen}
 import sysl.buf.{Buf, buf_filled}
 
 // The allocating forms agree with the core routines, which tests_lu checks against their definitions;
@@ -110,3 +110,57 @@ heap_lu_empty()
     assert(getrf_alloc(matrix_mut(s[0..<0], 0, 3, 1), ipiv[..]) == Ok(()))
     getrs_alloc(Transpose.NoTrans, matrix(s[0..<0], 0, 0, 1), ipiv[0..<0], matrix_mut(s[0..<0], 0, 2, 1))
     assert(s[0] == 9 && ipiv[0] == 7)
+
+/** The symmetric 100 x 100 test matrix: a diagonal 0, 1, …, 99 plus a small symmetric perturbation. */
+private symmetric(n: usize) -> Buf[f64]
+    val s: Buf[f64] = buf_filled(n * n, 0)
+    for j in 0..<n
+        for i in 0..<n
+            s[i + j * n] = (if i == j then f64(i) else 0) + (f64((i * 7 + j * 7) % 11) - 5) / 1000
+    s
+
+@test("syev_alloc past a block, from either triangle: A V = V Λ, and the values alone agree")
+heap_syev()
+    val n: usize = 100
+    for uplo in [Uplo.Lower, Uplo.Upper]
+        val a = symmetric(n)
+        val v = symmetric(n)
+        val f = symmetric(n)
+        val w: Buf[f64] = buf_filled(n, 0)
+        val only: Buf[f64] = buf_filled(n, 0)
+        assert(syev_alloc(Eigen.Vectors, uplo, matrix_mut(v.view(), n, n, n), w.view()) == Ok(()))
+        assert(syev_alloc(Eigen.Values, uplo, matrix_mut(f.view(), n, n, n), only.view()) == Ok(()))
+        for j in 0..<n
+            assert((w[j] - only[j]).abs() < 1e-12)
+            for i in 0..<n
+                var s = -w[j] * v[i + j * n]
+                for p in 0..<n do s += a[i + p * n] * v[p + j * n]
+                assert(s.abs() < 1e-12)
+
+@test("sytrd_alloc and orgtr_alloc reduce past a block: Qᵀ A Q is the tridiagonal T")
+heap_sytrd()
+    val n: usize = 70
+    for uplo in [Uplo.Lower, Uplo.Upper]
+        val a = symmetric(n)
+        val q = symmetric(n)
+        val d: Buf[f64] = buf_filled(n, 0)
+        val e: Buf[f64] = buf_filled(n - 1, 0)
+        val tau: Buf[f64] = buf_filled(n - 1, 0)
+        sytrd_alloc(uplo, matrix_mut(q.view(), n, n, n), d.view(), e.view(), tau.view())
+        orgtr_alloc(uplo, matrix_mut(q.view(), n, n, n), tau.view())
+        for j in 0..<n
+            for i in 0..<n
+                var s: f64 = 0
+                for p in 0..<n
+                    for r in 0..<n do s += q[p + i * n] * a[p + r * n] * q[r + j * n]
+                val t = if i == j then d[i] else if i == j + 1 then e[j] else if j == i + 1 then e[i] else 0
+                assert((s - t).abs() < 1e-12)
+
+@test("syev_alloc passes NoConvergence through on a NaN, and on empty input needs nothing")
+heap_syev_nan()
+    var s: [9]f64 = [1, f64.nan(), 1, f64.nan(), 2, 1, 1, 1, 3]
+    var w: [3]f64
+    assert(syev_alloc(Eigen.Values, Uplo.Lower, matrix_mut(s[..], 3, 3, 3), w[..]) is Err(Error.NoConvergence(_)))
+    var e: [1]f64 = [9]
+    assert(syev_alloc(Eigen.Vectors, Uplo.Upper, matrix_mut(e[0..<0], 0, 0, 1), e[0..<0]) == Ok(()))
+    assert(e[0] == 9)

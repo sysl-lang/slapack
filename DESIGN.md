@@ -14,7 +14,7 @@ float edge cases — and a gap it finds is a gap to fix in sysl.
 | LU | `getrf` (blocked), `getf2` (its unblocked panel), `getrs`, `laswp` | done, f32 and f64 |
 | Cholesky | `potrf` (blocked), `potf2` (its unblocked kernel), `potrs` | done, f32 and f64 |
 | QR | `geqrf` (blocked), `geqr2` (its unblocked panel), `orgqr`, `org2r`, `ormqr`, `larfg` | done, f32 and f64 |
-| symmetric eigenproblem | `syev` (`sytrd`, `orgtr`, `steqr`/`sterf`) | planned |
+| symmetric eigenproblem | `syev`, `sytrd` (unblocked), `orgtr`, `steqr`, `sterf` | done, f32 and f64 |
 | singular value decomposition | `gesvd` (`gebrd`, `orgbr`, `bdsqr`) | planned |
 
 Complex element types, the banded and packed storage forms, and the expert drivers (`gesvx` and its
@@ -45,6 +45,12 @@ orgqr(q, tau, qr_work)                     // Q's first q.cols columns from tau.
 org2r(q, tau, work)                        // the unblocked form
 ormqr(Side.Left, Transpose.Trans, a, tau, c, qr_work)  // c := Qᵀ c; Right gives c Q or c Qᵀ
 larfg(alpha, x)                            // (beta, tau): the reflector taking (alpha, x) to (beta, 0)
+syev(Eigen.Vectors, Uplo.Lower, a, w, syev_work)  // Result[unit, Error]: w ascending, a := V
+syev(Eigen.Values, Uplo.Upper, a, w, syev_work)   // the eigenvalues alone
+sytrd(uplo, a, d, e, tau, work)            // Qᵀ A Q = T: d and e its diagonals, reflectors in a
+orgtr(uplo, q, tau, qr_work)               // Q from sytrd's reflectors
+steqr(d, e, z)                             // Result: T's eigenvalues, its vectors carried into z
+sterf(d, e)                                // Result: T's eigenvalues alone
 ```
 
 **Workspace is the caller's, as in sblas.** `getrf` and `getrs` take sblas's `GemmWork` packing buffers
@@ -53,9 +59,13 @@ nrhs)` (and `potrf_work_len[T](n)`, `potrs_work_len[T](n, nrhs)`); the core modu
 builds for a board with no heap. The QR routines need a block reflector's factor and product besides
 the packing buffers, so they take a `QrWork(block, gemm)`, sized by `geqrf_work_len[T](m, n)`,
 `orgqr_work_len[T](m, n, k)` and `ormqr_work_len[T](side, m, n, k)` as a `QrWorkLen(block, gemm)`;
-the unblocked `geqr2` and `org2r` take one vector of `a.cols`. `sh.sysl.slapack.heap` holds
-`getrf_alloc`, `getrs_alloc`, `potrf_alloc`, `potrs_alloc`, `geqrf_alloc`, `orgqr_alloc` and
-`ormqr_alloc`, which allocate the buffers per call.
+the unblocked `geqr2` and `org2r` take one vector of `a.cols`. `syev` takes a `SyevWork(tri, qr)`
+sized by `syev_work_len[T](eigen, n)`: `tri` holds T's off-diagonal, the reflectors' scales and
+`sytrd`'s two vectors, and `qr` is `orgtr`'s `QrWork` (`orgtr_work_len[T](n)`), empty for `Values`;
+`sytrd` takes one vector of `sytrd_work_len[T](n)`, and `steqr` and `sterf` take none.
+`sh.sysl.slapack.heap` holds `getrf_alloc`, `getrs_alloc`, `potrf_alloc`, `potrs_alloc`,
+`geqrf_alloc`, `orgqr_alloc`, `ormqr_alloc`, `sytrd_alloc`, `orgtr_alloc` and `syev_alloc`, which
+allocate the buffers per call.
 
 **The triangle is an `Uplo`, sblas's own enum.** Unlike `getrs`'s `Transpose`, it could have been a
 view: the upper triangle of A is the lower triangle of `a.t()`, and the upper factor is the transposed
@@ -88,8 +98,11 @@ positive definite, an iteration that did not converge). slapack separates them.
   the `_work_len` says. These are bugs in the caller, not conditions to handle, and reference LAPACK's
   own `xerbla` stops the program for them too.
 
-`Error` is an enum so that the families still to come add their own variants (`NotPositiveDefinite`
-for `potrf`, `NoConvergence` for `syev` and `gesvd`) rather than a second error type per routine.
+`Error` is an enum so that each family adds its own variants (`NotPositiveDefinite` for `potrf`,
+`NoConvergence(unconverged)` for `syev`, `steqr` and `sterf`, and later `gesvd`) rather than a second
+error type per routine. `NoConvergence` carries LAPACK's positive `info`: how many off-diagonal
+elements of T were still not zero after 30 n sweeps. As in LAPACK the eigenvalues are then left
+unsorted, as the iteration reached them.
 
 **The QR routines answer nothing.** Every matrix has a QR factorisation, so `dgeqrf`'s `info` is only
 ever about the arguments: here those trap — a `tau` shorter than `min(m, n)`, a Q with more columns
@@ -191,6 +204,56 @@ first, applies its reflector to the columns right of it and forms its own with `
 last — each through `larft` and `larfb` with `trans`; within one block's width it is `larf` per
 reflector, as `dorm2r`.
 
+## The symmetric eigenproblem
+
+`syev` takes LAPACK's path. A matrix whose largest element lies outside [√(safmin/ε), √(ε/safmin)] is
+scaled into it first, and its eigenvalues scaled back after, as `dsyev` does. Then:
+
+1. `sytrd` reduces A to a symmetric tridiagonal T = Qᵀ A Q by `n − 1` Householder reflections. For
+   column `i`, `larfg` makes the reflector that zeroes A(i+2:n, i), and the trailing block is updated
+   on both sides at once, A₂₂ −= v wᵀ + w vᵀ with w = τ A₂₂ v − ½ τ² (vᵀ A₂₂ v) v — a symmetric
+   matrix-vector product and a symmetric rank-2 update, LAPACK's `dsytd2`;
+2. with `Vectors`, `orgtr` forms Q: the reflectors move one column right, so that those of the order
+   `n − 1` block from (1, 1) lie below its diagonal, and `orgqr` forms that block — blocked from 33
+   reflectors on, through the QR family's `larft` and `larfb`;
+3. `steqr` diagonalises T by the implicit QL or QR iteration with Wilkinson shifts, carrying every plane
+   rotation into Q's columns, so that Q becomes V; with `Values`, `sterf` runs the root-free variant
+   (Pal, Walker and Kahan), which iterates on the squares of the off-diagonal and forms no rotation.
+
+Both iterations are LAPACK's `dsteqr` and `dsterf` step for step: T is split wherever an off-diagonal
+element is negligible beside its neighbours on the diagonal, each block is scaled into range if its
+largest element is not (LAPACK's `lanst` and `lascl`), and iterated as QL from the top when its bottom
+element is the larger and as QR from the bottom otherwise; a 2 x 2 block is solved outright
+(`laev2`); the rotations are LAPACK 3.10's `lartg`. The eigenvalues come back ascending — by
+selection in `steqr`, so that each vector moves at most once.
+
+**The reduction is unblocked.** LAPACK's `dsytrd` gathers 32 columns at a time with `dlatrd` and
+updates the trailing matrix with one `dsyr2k`; sblas has no `syr2k`, and for the orders this package
+tests the unblocked form is a few milliseconds. `orgtr` is blocked, since it is `orgqr`.
+
+**sblas has no `symv` or `syr2`**, which `dsytd2` calls once per column. slapack's private
+`symv_lower` reads the lower triangle once, each column below the diagonal as one `axpy` into y and one
+`dot` with x; `syr2_lower` is two `axpy`s per column of the triangle. Neither touches the other
+triangle, so `syev` with `Values` leaves it as it was.
+
+**One triangle, as in Cholesky.** The upper triangle of a symmetric A is the lower triangle of `a.t()`,
+so `Upper` is the lower reduction of the transposed view: the reflectors land right of A's
+superdiagonal and Q = H(0) … H(n−2) as from `Lower`. LAPACK reduces the upper triangle from the bottom
+instead (Q = H(n−2) … H(0), and `dorgtr` calls `dorgql`), so its `Upper` T, τ and Q differ from these;
+the eigenvalues do not, nor the eigenvectors up to sign. `orgtr` from `Upper` forms Q in the view
+`a.t()`, so `a` holds Qᵀ, and one pass of `swap`s across the diagonal leaves Q.
+
+**`steqr` needs no workspace.** `dsteqr` saves each sweep's rotations in `work` and applies them with
+one `dlasr`; slapack applies each rotation to its two columns of Z with sblas's `rot` as it is made.
+The order is the one `dlasr` would apply them in, and Z does not feed back into d or e, so the result
+is the same, bit for bit. `steqr` always carries vectors (LAPACK's `compz = 'V'`): the identity as Z
+gives T's own, and values alone are `sterf`.
+
+**A NaN usually ends in `NoConvergence`.** A NaN in the referenced triangle spreads through the
+reduction into T, no off-diagonal element is ever negligible, and the iteration runs out of sweeps —
+which is what the platform's `dsyev` answers too. A NaN that leaves only a 2 x 2 block unreduced is
+solved outright, NaN eigenvalues and `Ok`, as in LAPACK.
+
 ## Oracles
 
 `sysl test .` checks the routines against their definitions: systems factored and solved by hand,
@@ -224,6 +287,28 @@ columns small enough that `larfg` scales them and big enough to overflow a sum o
 block of a larger matrix, bit for bit with the same matrix alone and nothing around it touched; a
 row-major view; `ormqr` reading the whole of a wide A; and a trap for every call that is wrong.
 
+The eigenproblem is checked by LAPACK's `dsyt21` measures: ‖A V − V Λ‖ / (n ‖A‖ ε) and ‖I − Vᵀ V‖ /
+(n ε) for `syev`, and ‖A − Q T Qᵀ‖ / (n ‖A‖ ε) and Q's orthogonality for `sytrd` and `orgtr` — all
+under 30, on random symmetric matrices of every order 1 to 64 and past `orgqr`'s block (65, 100, 128,
+129), from each triangle, at f32 and f64, with the other triangle, the padding and every workspace
+NaN. The eigenvalues come back ascending, the values alone agree with the vectors' within the same
+threshold and leave the other triangle as it was, `sytrd` leaves T's diagonals in A beside its
+own, and every τ is zero or in [1, 2]. Each of 24 mutations of the routines — a rotation's sign in
+each branch, the sort, the reduction's ½, `symv` or `syr2` losing a term, `orgtr`'s shift and
+transpose, every scaling and its undoing, the root-free step, the deflation test, `lartg`, `laev2`
+and the convergence count — turns at least one test red. Exactly, or
+within 2 ε: three 2 x 2s worked by hand (positive, zero and negative trace); a diagonal matrix, whose
+values are its diagonal sorted and whose vectors are a permutation; an already tridiagonal one, which
+`sytrd` returns bit for bit with every τ zero; the identity and the zero matrix, whose vectors are the
+identity. Within the threshold: repeated eigenvalues (clusters of four, three and two, and the
+all-ones matrix's n − 1 zeros), a matrix 2^±900 (f64) or 2^±60 (f32) times a random one, and
+tridiagonals 2^±600 and 2^±100 whose blocks `steqr` and `sterf` scale; a subnormal matrix (2^−1060 times small integers), whose
+eigenvalues must be within two subnormal units of the unscaled ones' — which only `syev`'s own scaling
+achieves, since the matrices above are handled by the iteration's scaling alone; a NaN answering
+`NoConvergence` from every path; empty input and order one; a block of a larger matrix, bit for bit
+with the matrix alone and nothing around it touched; a row-major view; and a trap for every call that
+is wrong.
+
 `oracle/`, a project of its own so that the package links nothing, factors the same random matrices
 with the platform's `dgetrf` and `sgetrf` through the [lapack](https://github.com/sysl-lang/lapack)
 binding (Accelerate on macOS) and requires the same pivots, the same first zero pivot, and every factor
@@ -242,6 +327,15 @@ the reflector are compared too, where they differ τ + τ' = 2; all within 64 ma
 and slapack choose the same sign on every row of every one of these matrices (sysl 0.8.3, macOS), so
 the oracle requires it: no row is flipped, and R, τ and the reflectors agree outright. A `larfg` with
 the sign reversed turns all three oracle tests red.
+
+For the eigenproblem the oracle runs the platform's `dsyev` and `ssyev` — declared in the oracle
+itself, since the binding binds only the divide-and-conquer `?syevd` — on random symmetric matrices of
+every order 1 to 64 and 65, 100, 128, 129, from each triangle, with and without vectors. Every
+eigenvalue agrees within 64 n ε ‖A‖₁, and each eigenvector, up to its sign, within that bound over
+its eigenvalue's gap to the nearest other one — how far rounding can turn an eigenvector. The
+platform's `Upper` reduction differs from slapack's (see above), so this compares the results and not
+the intermediate T. A matrix holding a NaN makes both answer that the iteration did not converge
+(`info > 0`), from either triangle and either path (sysl 0.8.3, macOS).
 
 ## Gaps found so far
 

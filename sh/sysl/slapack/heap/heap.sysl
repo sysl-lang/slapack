@@ -1,7 +1,7 @@
 module sh.sysl.slapack.heap
 
 import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, Side, Uplo}
-import sh.sysl.slapack.{Error, Transpose, QrWork, getrf, getrf_work_len, getrs, getrs_work_len, potrf, potrf_work_len, potrs, potrs_work_len, geqrf, geqrf_work_len, orgqr, orgqr_work_len, ormqr, ormqr_work_len}
+import sh.sysl.slapack.{Error, Transpose, QrWork, getrf, getrf_work_len, getrs, getrs_work_len, potrf, potrf_work_len, potrs, potrs_work_len, geqrf, geqrf_work_len, orgqr, orgqr_work_len, ormqr, ormqr_work_len, Eigen, SyevWork, syev, syev_work_len, sytrd, sytrd_work_len, orgtr, orgtr_work_len}
 import sysl.buf.{Buf, buf_filled}
 
 // The routines of sh.sysl.slapack that need scratch storage, in the form that allocates it per call.
@@ -59,3 +59,25 @@ ormqr_alloc[T: Real](side: Side, trans: Transpose, a: Matrix[T], tau: []const T,
     val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
     val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
     ormqr(side, trans, a, tau, c, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+
+/** `sytrd`, with its work vector allocated for the call and freed after it. */
+sytrd_alloc[T: Real](uplo: Uplo, a: MatrixMut[T], d: []T, e: []T, tau: []T)
+    val work: Buf[T] = buf_filled(sytrd_work_len[T](a.rows), T.zero())
+    sytrd(uplo, a, d, e, tau, work.view())
+
+/** `orgtr`, with its workspace allocated for the call and freed after it. */
+orgtr_alloc[T: Real](uplo: Uplo, a: MatrixMut[T], tau: []const T)
+    val len = orgtr_work_len[T](a.rows)
+    val block: Buf[T] = buf_filled(len.block, T.zero())
+    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    orgtr(uplo, a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+
+/** `syev`, with its workspace allocated for the call and freed after it. */
+syev_alloc[T: Real](eigen: Eigen, uplo: Uplo, a: MatrixMut[T], w: []T) -> Result[unit, Error]
+    val len = syev_work_len[T](eigen, a.rows)
+    val tri: Buf[T] = buf_filled(len.tri, T.zero())
+    val block: Buf[T] = buf_filled(len.qr.block, T.zero())
+    val pa: Buf[T] = buf_filled(len.qr.gemm.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.qr.gemm.b, T.zero())
+    syev(eigen, uplo, a, w, SyevWork(tri.view(), QrWork(block.view(), GemmWork(pa.view(), pb.view()))))

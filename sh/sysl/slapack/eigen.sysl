@@ -1,0 +1,641 @@
+module sh.sysl.slapack
+@no_alloc
+
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWorkLen, Uplo, view, view_mut, axpy, dot, rot, scal, swap}
+import sysl.math.{min, max}
+
+// The symmetric eigenproblem, A = V Λ Vᵀ, by LAPACK's path: `sytrd` reduces A to a tridiagonal T =
+// Qᵀ A Q by Householder reflections, `orgtr` forms Q, and the implicit QL/QR iteration with Wilkinson
+// shifts diagonalises T — `steqr` carrying the rotations into Q's columns, `sterf` (root-free) when
+// only the values are wanted.
+//
+// Only one triangle of A is read, as in Cholesky. The upper triangle of A is the lower triangle of
+// `a.t()`, and A is symmetric, so `Upper` is the lower reduction of the transposed view: the
+// reflectors lie in A's upper triangle, right of the superdiagonal, and Q is the same product of them
+// as from `Lower`. LAPACK reduces the upper triangle from the bottom instead, so its `Upper` T and Q
+// differ from these; the eigenvalues, and the eigenvectors up to sign, do not.
+
+/** Whether `syev` answers the eigenvalues alone or the eigenvectors too: LAPACK's `jobz`. */
+enum Eigen
+    /** The eigenvalues only, by `sterf`; A's `uplo` triangle is destroyed. */
+    Values
+    /** The eigenvalues and, in place of A, the eigenvectors, by `orgtr` and `steqr`. */
+    Vectors
+
+/** The scratch storage of `syev`. `tri` holds the tridiagonal form's off-diagonal, the reflectors'
+ * scales and `sytrd`'s two vectors; `qr` is `orgtr`'s workspace, empty for `Values`. `syev_work_len`
+ * says how long each must be.
+ */
+struct SyevWork[T]
+    tri: []T
+    qr: QrWork[T]
+
+/** How many elements each buffer of a `SyevWork` needs. */
+struct SyevWorkLen
+    tri: usize
+    qr: QrWorkLen
+
+/** LAPACK's `maxit`: the sweeps allowed per eigenvalue before the iteration gives up. */
+private const max_sweeps: usize = 30
+
+/** The unit roundoff, LAPACK's `dlamch('E')`: half the distance from one to the next float. */
+private unit_roundoff[T: Real]() -> T = T.epsilon() / T(2)
+
+/** The largest magnitude among `d` and `e`, LAPACK's `lanst('M')`; a NaN answers NaN. */
+private lanst[T: Real](d: []const T, e: []const T) -> T
+    var most = T.zero()
+    for x in d
+        if x.is_nan() then return x
+        most = max(most, x.abs())
+    for x in e
+        if x.is_nan() then return x
+        most = max(most, x.abs())
+    most
+
+/** Multiplies `x` by `cto / cfrom` without overflow or underflow on the way, LAPACK's `lascl`: in steps
+ * of the safe minimum or its reciprocal until the remaining factor is safe to form.
+ */
+private lascl[T: Real](cfrom: T, cto: T, x: []T)
+    val small = T.safe_min()
+    val big = T.one() / small
+    var from = cfrom
+    var to = cto
+    loop
+        val from1 = from * small
+        var mul = to / from
+        var done = true
+        if from1 != from
+            val to1 = to / big
+            if to1 == to
+                // `to` is zero or infinite.
+                mul = to
+            else if from1.abs() > to.abs() && to != T.zero()
+                mul = small
+                done = false
+                from = from1
+            else if to1.abs() > from.abs()
+                mul = big
+                done = false
+                to = to1
+        for i in 0..<x.len do x[i] = x[i] * mul
+        if done then break
+
+/** The plane rotation `[c s; −s c]` with `[c s; −s c] (f, g) = (r, 0)`, LAPACK's `lartg`: `c ≥ 0`, and
+ * `r` has `f`'s sign. Answers `(c, s, r)`, scaling where `f² + g²` would overflow or underflow.
+ */
+private lartg[T: Real](f: T, g: T) -> (T, T, T)
+    if g == T.zero() then return (T.one(), T.zero(), f)
+    if f == T.zero() then return (T.zero(), T.one().copysign(g), g.abs())
+    val safmin = T.safe_min()
+    val safmax = T.one() / safmin
+    val rtmin = safmin.sqrt()
+    val rtmax = (safmax / T(2)).sqrt()
+    val (f1, g1) = (f.abs(), g.abs())
+    if f1 > rtmin && f1 < rtmax && g1 > rtmin && g1 < rtmax
+        val d = (f * f + g * g).sqrt()
+        val r = d.copysign(f)
+        return (f1 / d, g / r, r)
+    val u = min(safmax, max(safmin, max(f1, g1)))
+    val (fs, gs) = (f / u, g / u)
+    val d = (fs * fs + gs * gs).sqrt()
+    val r = d.copysign(f)
+    (fs.abs() / d, gs / r, r * u)
+
+/** The eigensystem of the symmetric 2 x 2 `[a b; b c]`, LAPACK's `laev2`: answers `(rt1, rt2, cs, sn)`,
+ * `rt1` the eigenvalue of larger magnitude, `rt2` the other, and `(cs, sn)` the unit eigenvector of
+ * `rt1`.
+ */
+private laev2[T: Real](a: T, b: T, c: T) -> (T, T, T, T)
+    val sm = a + c
+    val df = a - c
+    val adf = df.abs()
+    val tb = b + b
+    val ab = tb.abs()
+    val (acmx, acmn) = if a.abs() > c.abs() then (a, c) else (c, a)
+    val rt = if adf > ab then adf * (T.one() + (ab / adf) * (ab / adf)).sqrt() else if adf < ab then ab * (T.one() + (adf / ab) * (adf / ab)).sqrt() else ab * T(2).sqrt()
+    val half = T.one() / T(2)
+    var rt1 = half * rt
+    var rt2 = -half * rt
+    var sgn1 = 1
+    if sm < T.zero()
+        rt1 = half * (sm - rt)
+        sgn1 = -1
+        rt2 = (acmx / rt1) * acmn - (b / rt1) * b
+    else if sm > T.zero()
+        rt1 = half * (sm + rt)
+        rt2 = (acmx / rt1) * acmn - (b / rt1) * b
+    val (cs, sgn2) = if df >= T.zero() then (df + rt, 1) else (df - rt, -1)
+    var cs1 = T.one()
+    var sn1 = T.zero()
+    if cs.abs() > ab
+        val ct = -tb / cs
+        sn1 = T.one() / (T.one() + ct * ct).sqrt()
+        cs1 = ct * sn1
+    else if ab != T.zero()
+        val tn = -cs / tb
+        cs1 = T.one() / (T.one() + tn * tn).sqrt()
+        sn1 = tn * cs1
+    if sgn1 == sgn2
+        val tn = cs1
+        cs1 = -sn1
+        sn1 = tn
+    (rt1, rt2, cs1, sn1)
+
+/** y := α A x for the `m` x `m` symmetric A of which only the lower triangle of `a` is read: BLAS's
+ * `symv`, which sblas does not have. Each column below the diagonal is one `axpy` into y and one `dot`
+ * with x, so that the triangle is read once.
+ */
+private symv_lower[T: Real](alpha: T, a: Matrix[T], x: []const T, y: []T)
+    val m = a.rows
+    for k in 0..<m do y[k] = T.zero()
+    for j in 0..<m
+        y[j] = y[j] + alpha * a.at(j, j) * x[j]
+        if j + 1 < m
+            val below = a.block(j + 1, j, m - j - 1, 1).col(0)
+            axpy(alpha * x[j], below, view_mut(y[j + 1..<m]))
+            y[j] = y[j] + alpha * dot(below, view(x[j + 1..<m]))
+
+/** A += α (x yᵀ + y xᵀ) on the lower triangle of `a`, the other never touched: BLAS's `syr2`, which
+ * sblas does not have; two `axpy`s per column.
+ */
+private syr2_lower[T: Real](alpha: T, x: []const T, y: []const T, a: MatrixMut[T])
+    val m = a.rows
+    for j in 0..<m
+        val col = a.block(j, j, m - j, 1).col(0)
+        axpy(alpha * y[j], view(x[j..<m]), col)
+        axpy(alpha * x[j], view(y[j..<m]), col)
+
+/** The reduction of the lower triangle of `l`, LAPACK's `sytd2` from `Lower`, with `work` at least
+ * `2 (n − 1)` long.
+ */
+private tridiagonalise[T: Real](l: MatrixMut[T], d: []T, e: []T, tau: []T, work: []T)
+    val n = l.rows
+    if n == 0 then return
+    for i in 0..<n - 1
+        // The reflector H(i) = I − τ v vᵀ, v = (1, l(i+2:, i)), takes l(i+1:, i) to (β, 0).
+        val m = n - i - 1
+        val (beta, ti) = larfg(l.at(i + 1, i), l.block(i + 2, i, m - 1, 1).col(0))
+        e[i] = beta
+        if ti != T.zero()
+            val v = work[0..<m]
+            val w = work[m..<2 * m]
+            v[0] = T.one()
+            for k in 1..<m do v[k] = l.at(i + 1 + k, i)
+            // A₂₂ := H A₂₂ H = A₂₂ − v wᵀ − w vᵀ, with x = τ A₂₂ v and w = x − ½ τ (xᵀ v) v.
+            val a22 = l.block(i + 1, i + 1, m, m)
+            symv_lower(ti, a22.as_view(), v, w)
+            val alpha = -(ti / T(2)) * dot(view(w), view(v))
+            axpy(alpha, view(v), view_mut(w))
+            syr2_lower(-T.one(), v, w, a22)
+        l.set(i + 1, i, beta)
+        d[i] = l.at(i, i)
+        tau[i] = ti
+    d[n - 1] = l.at(n - 1, n - 1)
+
+/** How long the work vector `sytrd` takes must be, for an order-`n` A: two vectors of `n − 1`. */
+sytrd_work_len[T: Real](n: usize) -> usize = if n < 2 then 0 else 2 * (n - 1)
+
+/** LAPACK's `sytrd`: reduces the symmetric A to tridiagonal form, Qᵀ A Q = T, by Householder
+ * reflections, unblocked (LAPACK's `sytd2`).
+ *
+ * Reads and writes only the `uplo` triangle of `a`. T's diagonal goes to `d[0..<n]` and its
+ * off-diagonal to `e[0..<n − 1]`, and also into `a` beside the diagonal; the `n − 1` reflectors lie
+ * past it — below the subdiagonal (`Lower`) or right of the superdiagonal (`Upper`, the lower case of
+ * `a.t()`) — with their scales in `tau[0..<n − 1]`, so that Q = H(0) … H(n−2), H(i) acting on rows
+ * `i + 1` on. `work` is at least `sytrd_work_len` long. Traps if `a` is not square or a slice is short.
+ */
+sytrd[T: Real](uplo: Uplo, a: MatrixMut[T], d: []T, e: []T, tau: []T, work: []T)
+    assert(a.rows == a.cols, "sytrd reduces a square matrix")
+    val n = a.rows
+    assert(d.len >= n, "d is shorter than A's order")
+    assert(e.len + 1 >= n && tau.len + 1 >= n, "e or tau is shorter than A's order less one")
+    assert(work.len >= sytrd_work_len[T](n), "sytrd's work is shorter than sytrd_work_len says")
+    tridiagonalise(lower_of(uplo, a), d, e, tau, work)
+
+/** Q in place of the reflectors in the lower triangle of `l`, LAPACK's `orgtr` from `Lower`. */
+private form_tridiagonal_q[T: Real](l: MatrixMut[T], tau: []const T, work: QrWork[T])
+    val n = l.rows
+    if n == 0 then return
+    // Each reflector moves one column right, so that the reflectors of the order n − 1 block from
+    // (1, 1) lie below its diagonal, as orgqr reads them; Q's first row and column are e₀'s.
+    for step in 0..<n - 1
+        val j = n - 1 - step
+        l.set(0, j, T.zero())
+        for i in j + 1..<n do l.set(i, j, l.at(i, j - 1))
+    l.set(0, 0, T.one())
+    for i in 1..<n do l.set(i, 0, T.zero())
+    if n > 1 then orgqr(l.block(1, 1, n - 1, n - 1), tau[0..<n - 1], work)
+
+/** How long each buffer of the `QrWork` that `orgtr` takes must be, for an order-`n` Q: `orgqr`'s, for
+ * the order `n − 1` block the reflectors make.
+ */
+orgtr_work_len[T: Real](n: usize) -> QrWorkLen = if n < 2 then QrWorkLen(0, GemmWorkLen(0, 0)) else orgqr_work_len[T](n - 1, n - 1, n - 1)
+
+/** LAPACK's `orgtr`: the orthogonal Q of `sytrd`'s reduction, in place of the reflectors `sytrd` left
+ * in the `uplo` triangle of `a` and their scales in `tau[0..<n − 1]`.
+ *
+ * Reads only the reflectors and overwrites all of `a` with Q. `work` is at least `orgtr_work_len`
+ * long in each buffer. Traps if `a` is not square, `tau` is short, or `work` is.
+ */
+orgtr[T: Real](uplo: Uplo, a: MatrixMut[T], tau: []const T, work: QrWork[T])
+    assert(a.rows == a.cols, "orgtr forms a square Q")
+    val n = a.rows
+    assert(tau.len + 1 >= n, "tau is shorter than A's order less one")
+    val need = orgtr_work_len[T](n)
+    assert(work.block.len >= need.block && work.gemm.a.len >= need.gemm.a && work.gemm.b.len >= need.gemm.b, "orgtr's workspace is shorter than orgtr_work_len says")
+    form_tridiagonal_q(lower_of(uplo, a), tau, work)
+    // From `Upper` Q was formed in the view `a.t()`, so `a` holds Qᵀ; transposing it in place leaves Q.
+    if uplo == Uplo.Upper
+        for j in 0..<n
+            if j + 1 < n then swap(a.block(j + 1, j, n - j - 1, 1).col(0), a.block(j, j + 1, 1, n - j - 1).row(0))
+
+/** The tolerances of the QL/QR iteration, LAPACK's: `eps` the unit roundoff and its square, the safe
+ * minimum, and the bounds a block's largest element is scaled into.
+ */
+private struct Tolerances[T]
+    eps: T
+    eps2: T
+    safmin: T
+    ssfmax: T
+    ssfmin: T
+
+private tolerances[T: Real]() -> Tolerances[T]
+    val eps = unit_roundoff[T]()
+    val safmin = T.safe_min()
+    Tolerances(eps, eps * eps, safmin, (T.one() / safmin).sqrt() / T(3), safmin.sqrt() / (eps * eps))
+
+/** The end of the unreduced block that starts at `l1`: the first `m` from `l1` whose `e[m]` is
+ * negligible beside its neighbours on the diagonal, which is set to zero, or `n − 1`.
+ */
+private block_end[T: Real](d: []const T, e: []T, l1: usize, eps: T) -> usize
+    val n = d.len
+    for m in l1..<n - 1
+        val tst = e[m].abs()
+        if tst == T.zero() then return m
+        if tst <= d[m].abs().sqrt() * d[m + 1].abs().sqrt() * eps
+            e[m] = T.zero()
+            return m
+    n - 1
+
+/** How many of `e`'s elements are not zero: LAPACK's `info` when the iteration runs out of sweeps. */
+private unconverged[T: Real](e: []const T) -> usize
+    var count: usize = 0
+    for x in e
+        if x != T.zero() then count += 1
+    count
+
+/** LAPACK's `steqr` with `compz = 'V'`: the eigenvalues of the symmetric tridiagonal T with diagonal
+ * `d` and off-diagonal `e[0..<n − 1]`, `n = d.len`, by the implicit QL or QR iteration with Wilkinson
+ * shifts, and its eigenvectors carried into the columns of `z`.
+ *
+ * On return `d` holds the eigenvalues in ascending order, and `z` is the `z` given times the
+ * eigenvectors of T: given `orgtr`'s Q, the eigenvectors of A; given the identity, those of T. `e` is
+ * destroyed. Each block of T is iterated from whichever end has the smaller diagonal element, and each
+ * rotation is applied to `z` as it is made, in the order LAPACK's `lasr` applies the saved ones, so no
+ * workspace is needed. Answers `NoConvergence(k)` when, after 30 n sweeps, `k` elements of `e` are
+ * still not zero; `d` is then unsorted. Traps if `e` is short or `z` has not `n` columns.
+ */
+steqr[T: Real](d: []T, e: []T, z: MatrixMut[T]) -> Result[unit, Error]
+    val n = d.len
+    assert(e.len + 1 >= n, "e is shorter than T's order less one")
+    assert(z.cols == n, "Z's columns are not T's order")
+    if n <= 1 then return Ok(())
+    val tol = tolerances[T]()
+    val (eps, eps2, safmin) = (tol.eps, tol.eps2, tol.safmin)
+    val two = T(2)
+    val sweeps = n * max_sweeps
+    var jtot: usize = 0
+    var l1: usize = 0
+    while l1 < n
+        if l1 > 0 then e[l1 - 1] = T.zero()
+        val top = l1
+        val bottom = block_end(d, e, l1, eps)
+        l1 = bottom + 1
+        if bottom == top then continue
+        // Scale the block into range.
+        val anorm = lanst(d[top..bottom], e[top..<bottom])
+        if anorm == T.zero() then continue
+        val scale = if anorm > tol.ssfmax then tol.ssfmax else if anorm < tol.ssfmin then tol.ssfmin else T.zero()
+        if scale != T.zero()
+            lascl(anorm, scale, d[top..bottom])
+            lascl(anorm, scale, e[top..<bottom])
+        // QL from the top when the bottom element is the larger, QR from the bottom otherwise.
+        if d[bottom].abs() >= d[top].abs()
+            var l = top
+            val lend = bottom
+            loop
+                // A negligible element below l ends the part being iterated.
+                var m = lend
+                for k in l..<lend
+                    val tst = e[k].abs() * e[k].abs()
+                    if tst <= eps2 * d[k].abs() * d[k + 1].abs() + safmin
+                        m = k
+                        break
+                if m < lend then e[m] = T.zero()
+                if m == l
+                    // d[l] is an eigenvalue.
+                    l += 1
+                    if l > lend then break
+                    continue
+                if m == l + 1
+                    val (rt1, rt2, c, s) = laev2(d[l], e[l], d[l + 1])
+                    rot(z.col(l), z.col(l + 1), c, s)
+                    d[l] = rt1
+                    d[l + 1] = rt2
+                    e[l] = T.zero()
+                    l += 2
+                    if l > lend then break
+                    continue
+                if jtot == sweeps then break
+                jtot += 1
+                // The Wilkinson shift, from the leading 2 x 2.
+                var p = d[l]
+                var g = (d[l + 1] - p) / (two * e[l])
+                var r = lapy2(g, T.one())
+                g = d[m] - p + e[l] / (g + r.copysign(g))
+                var s = T.one()
+                var c = T.one()
+                p = T.zero()
+                for step in 0..<m - l
+                    val i = m - 1 - step
+                    val f = s * e[i]
+                    val b = c * e[i]
+                    val (cn, sn, rn) = lartg(g, f)
+                    c = cn
+                    s = sn
+                    if i != m - 1 then e[i + 1] = rn
+                    g = d[i + 1] - p
+                    r = (d[i] - g) * s + two * c * b
+                    p = s * r
+                    d[i + 1] = g + p
+                    g = c * r - b
+                    rot(z.col(i), z.col(i + 1), c, -s)
+                d[l] = d[l] - p
+                e[l] = g
+        else
+            var l = bottom
+            val lend = top
+            loop
+                // A negligible element above l ends the part being iterated.
+                var m = lend
+                for step in 0..<l - lend
+                    val k = l - step
+                    val tst = e[k - 1].abs() * e[k - 1].abs()
+                    if tst <= eps2 * d[k].abs() * d[k - 1].abs() + safmin
+                        m = k
+                        break
+                if m > lend then e[m - 1] = T.zero()
+                if m == l
+                    if l == lend then break
+                    l -= 1
+                    continue
+                if m + 1 == l
+                    val (rt1, rt2, c, s) = laev2(d[l - 1], e[l - 1], d[l])
+                    rot(z.col(l - 1), z.col(l), c, s)
+                    d[l - 1] = rt1
+                    d[l] = rt2
+                    e[l - 1] = T.zero()
+                    if l < lend + 2 then break
+                    l -= 2
+                    continue
+                if jtot == sweeps then break
+                jtot += 1
+                var p = d[l]
+                var g = (d[l - 1] - p) / (two * e[l - 1])
+                var r = lapy2(g, T.one())
+                g = d[m] - p + e[l - 1] / (g + r.copysign(g))
+                var s = T.one()
+                var c = T.one()
+                p = T.zero()
+                for i in m..<l
+                    val f = s * e[i]
+                    val b = c * e[i]
+                    val (cn, sn, rn) = lartg(g, f)
+                    c = cn
+                    s = sn
+                    if i != m then e[i - 1] = rn
+                    g = d[i] - p
+                    r = (d[i + 1] - g) * s + two * c * b
+                    p = s * r
+                    d[i] = g + p
+                    g = c * r - b
+                    rot(z.col(i), z.col(i + 1), c, s)
+                d[l] = d[l] - p
+                e[l - 1] = g
+        if scale != T.zero()
+            lascl(scale, anorm, d[top..bottom])
+            lascl(scale, anorm, e[top..<bottom])
+        if jtot >= sweeps
+            val left = unconverged(e[0..<n - 1])
+            if left > 0 then return Err(Error.NoConvergence(left))
+    // Ascending, by selection so that each vector moves at most once.
+    for i in 0..<n - 1
+        var k = i
+        var p = d[i]
+        for j in i + 1..<n
+            if d[j] < p
+                k = j
+                p = d[j]
+        if k != i
+            d[k] = d[i]
+            d[i] = p
+            swap(z.col(i), z.col(k))
+    Ok(())
+
+/** LAPACK's `sterf`: the eigenvalues of the symmetric tridiagonal T with diagonal `d` and
+ * off-diagonal `e[0..<n − 1]`, `n = d.len`, by the root-free variant of the QL/QR iteration
+ * (Pal, Walker and Kahan), which works with the squares of `e` and forms no rotation.
+ *
+ * On return `d` holds the eigenvalues in ascending order and `e` is destroyed. Answers
+ * `NoConvergence(k)` as `steqr` does, `d` then unsorted. Traps if `e` is short.
+ */
+sterf[T: Real](d: []T, e: []T) -> Result[unit, Error]
+    val n = d.len
+    assert(e.len + 1 >= n, "e is shorter than T's order less one")
+    if n <= 1 then return Ok(())
+    val tol = tolerances[T]()
+    val (eps, eps2) = (tol.eps, tol.eps2)
+    val two = T(2)
+    val sweeps = n * max_sweeps
+    var jtot: usize = 0
+    var l1: usize = 0
+    while l1 < n
+        if l1 > 0 then e[l1 - 1] = T.zero()
+        val top = l1
+        val bottom = block_end(d, e, l1, eps)
+        l1 = bottom + 1
+        if bottom == top then continue
+        val anorm = lanst(d[top..bottom], e[top..<bottom])
+        if anorm == T.zero() then continue
+        val scale = if anorm > tol.ssfmax then tol.ssfmax else if anorm < tol.ssfmin then tol.ssfmin else T.zero()
+        if scale != T.zero()
+            lascl(anorm, scale, d[top..bottom])
+            lascl(anorm, scale, e[top..<bottom])
+        for i in top..<bottom do e[i] = e[i] * e[i]
+        if d[bottom].abs() >= d[top].abs()
+            var l = top
+            val lend = bottom
+            loop
+                var m = lend
+                for k in l..<lend
+                    if e[k].abs() <= eps2 * (d[k] * d[k + 1]).abs()
+                        m = k
+                        break
+                if m < lend then e[m] = T.zero()
+                if m == l
+                    l += 1
+                    if l > lend then break
+                    continue
+                if m == l + 1
+                    val (rt1, rt2, _, _) = laev2(d[l], e[l].sqrt(), d[l + 1])
+                    d[l] = rt1
+                    d[l + 1] = rt2
+                    e[l] = T.zero()
+                    l += 2
+                    if l > lend then break
+                    continue
+                if jtot == sweeps then break
+                jtot += 1
+                var p = d[l]
+                val rte = e[l].sqrt()
+                var sigma = (d[l + 1] - p) / (two * rte)
+                val r0 = lapy2(sigma, T.one())
+                sigma = p - rte / (sigma + r0.copysign(sigma))
+                var c = T.one()
+                var s = T.zero()
+                var gamma = d[m] - sigma
+                p = gamma * gamma
+                for step in 0..<m - l
+                    val i = m - 1 - step
+                    val bb = e[i]
+                    val r = p + bb
+                    if i != m - 1 then e[i + 1] = s * r
+                    val oldc = c
+                    c = p / r
+                    s = bb / r
+                    val oldgam = gamma
+                    val alpha = d[i]
+                    gamma = c * (alpha - sigma) - s * oldgam
+                    d[i + 1] = oldgam + (alpha - gamma)
+                    p = if c != T.zero() then gamma * gamma / c else oldc * bb
+                e[l] = s * p
+                d[l] = sigma + gamma
+        else
+            var l = bottom
+            val lend = top
+            loop
+                var m = lend
+                for step in 0..<l - lend
+                    val k = l - step
+                    if e[k - 1].abs() <= eps2 * (d[k] * d[k - 1]).abs()
+                        m = k
+                        break
+                if m > lend then e[m - 1] = T.zero()
+                if m == l
+                    if l == lend then break
+                    l -= 1
+                    continue
+                if m + 1 == l
+                    val (rt1, rt2, _, _) = laev2(d[l], e[l - 1].sqrt(), d[l - 1])
+                    d[l] = rt1
+                    d[l - 1] = rt2
+                    e[l - 1] = T.zero()
+                    if l < lend + 2 then break
+                    l -= 2
+                    continue
+                if jtot == sweeps then break
+                jtot += 1
+                var p = d[l]
+                val rte = e[l - 1].sqrt()
+                var sigma = (d[l - 1] - p) / (two * rte)
+                val r0 = lapy2(sigma, T.one())
+                sigma = p - rte / (sigma + r0.copysign(sigma))
+                var c = T.one()
+                var s = T.zero()
+                var gamma = d[m] - sigma
+                p = gamma * gamma
+                for i in m..<l
+                    val bb = e[i]
+                    val r = p + bb
+                    if i != m then e[i - 1] = s * r
+                    val oldc = c
+                    c = p / r
+                    s = bb / r
+                    val oldgam = gamma
+                    val alpha = d[i + 1]
+                    gamma = c * (alpha - sigma) - s * oldgam
+                    d[i] = oldgam + (alpha - gamma)
+                    p = if c != T.zero() then gamma * gamma / c else oldc * bb
+                e[l - 1] = s * p
+                d[l] = sigma + gamma
+        if scale != T.zero() then lascl(scale, anorm, d[top..bottom])
+        if jtot >= sweeps
+            val left = unconverged(e[0..<n - 1])
+            if left > 0 then return Err(Error.NoConvergence(left))
+    // Ascending, by insertion.
+    for i in 1..<n
+        val x = d[i]
+        var j = i
+        while j > 0 && d[j - 1] > x
+            d[j] = d[j - 1]
+            j -= 1
+        d[j] = x
+    Ok(())
+
+/** How long each buffer of the `SyevWork` that `syev` takes must be, for an order-`n` A: `tri` holds
+ * the off-diagonal, the scales and `sytrd`'s two vectors, four times `n − 1`; `qr` is `orgtr`'s, and
+ * empty for `Values`.
+ */
+syev_work_len[T: Real](eigen: Eigen, n: usize) -> SyevWorkLen
+    val tri = if n < 2 then 0 else 4 * (n - 1)
+    val qr = if eigen == Eigen.Vectors then orgtr_work_len[T](n) else QrWorkLen(0, GemmWorkLen(0, 0))
+    SyevWorkLen(tri, qr)
+
+/** LAPACK's `syev`: the eigenvalues of the symmetric A, and with `Vectors` its eigenvectors.
+ *
+ * Reads only the `uplo` triangle of `a`. The eigenvalues go to `w[0..<n]` in ascending order; with
+ * `Vectors` all of `a` is overwritten by the orthonormal eigenvectors, column `j` that of `w[j]`, and
+ * with `Values` only the `uplo` triangle is written, holding `sytrd`'s reduction. A matrix whose
+ * largest element is too small or too large for the iteration is scaled first and its eigenvalues
+ * scaled back, as LAPACK does. `work` is at least `syev_work_len` long in each buffer. Answers
+ * `NoConvergence(k)` when the iteration did not converge — `w` then holds the diagonal it reached,
+ * unsorted — which a NaN in the matrix also gives. Traps if `a` is not square or `w` or `work` is
+ * short.
+ */
+syev[T: Real](eigen: Eigen, uplo: Uplo, a: MatrixMut[T], w: []T, work: SyevWork[T]) -> Result[unit, Error]
+    assert(a.rows == a.cols, "syev takes a square matrix")
+    val n = a.rows
+    assert(w.len >= n, "w is shorter than A's order")
+    val need = syev_work_len[T](eigen, n)
+    assert(work.tri.len >= need.tri, "syev's tri workspace is shorter than syev_work_len says")
+    assert(work.qr.block.len >= need.qr.block && work.qr.gemm.a.len >= need.qr.gemm.a && work.qr.gemm.b.len >= need.qr.gemm.b, "syev's qr workspace is shorter than syev_work_len says")
+    if n == 0 then return Ok(())
+    val l = lower_of(uplo, a)
+    if n == 1
+        w[0] = l.at(0, 0)
+        if eigen == Eigen.Vectors then a.set(0, 0, T.one())
+        return Ok(())
+    // Scale a matrix whose largest element is outside [√(safmin/ε), √(ε/safmin)] into it.
+    var anrm = T.zero()
+    for j in 0..<n
+        for i in j..<n
+            val x = l.at(i, j).abs()
+            if x.is_nan() || x > anrm then anrm = x
+    val small = T.safe_min() / T.epsilon()
+    val (rmin, rmax) = (small.sqrt(), (T.one() / small).sqrt())
+    val sigma = if anrm > T.zero() && anrm < rmin then rmin / anrm else if anrm > rmax then rmax / anrm else T.one()
+    if sigma != T.one()
+        for j in 0..<n do scal(sigma, l.block(j, j, n - j, 1).col(0))
+    val k = n - 1
+    val e = work.tri[0..<k]
+    val tau = work.tri[k..<2 * k]
+    tridiagonalise(l, w[0..<n], e, tau, work.tri[2 * k..<4 * k])
+    var result: Result[unit, Error] = Ok(())
+    if eigen == Eigen.Values
+        result = sterf(w[0..<n], e)
+    else
+        orgtr(uplo, a, tau, work.qr)
+        result = steqr(w[0..<n], e, a)
+    if sigma != T.one()
+        for i in 0..<n do w[i] = w[i] / sigma
+    result

@@ -3,9 +3,11 @@ module sh.sysl.slapack_oracle
 import sh.sysl.blas.MatrixView
 import sh.sysl.lapack.{Scalar, lu_inplace, chol_inplace, qr_inplace}
 import sh.sysl.sblas.{Real, Uplo, matrix_mut}
-import sh.sysl.slapack.heap.{getrf_alloc, potrf_alloc, geqrf_alloc}
+import sh.sysl.slapack.Eigen
+import sh.sysl.slapack.heap.{getrf_alloc, potrf_alloc, geqrf_alloc, syev_alloc}
 import sysl.buf.{Buf, buf_filled}
-import sysl.math.min
+import sysl.math.{min, max}
+import sysl.slices.as_mut_ptr
 
 // slapack's getrf and potrf beside the platform's (Accelerate on macOS, OpenBLAS elsewhere), on the
 // same matrix: the same pivots, the same zero pivot or failing minor, and factors that agree to within
@@ -26,6 +28,7 @@ slapack_lu[T: Real](a: []const T, m: usize, n: usize) -> Factored[T]
         Ok(_) -> None
         Err(Singular(j)) -> Some(j)
         Err(NotPositiveDefinite(_)) -> panic("getrf answered a Cholesky error")
+        Err(NoConvergence(_)) -> panic("getrf answered an eigenvalue error")
     Factored(f, ipiv, zero)
 
 /** The platform's getrf of the same matrix, its 1-based pivots and `info` brought to slapack's terms. */
@@ -53,6 +56,7 @@ slapack_chol[T: Real](uplo: Uplo, a: []const T, n: usize) -> Cholesky[T]
         Ok(_) -> None
         Err(NotPositiveDefinite(j)) -> Some(j)
         Err(Singular(_)) -> panic("potrf answered an LU error")
+        Err(NoConvergence(_)) -> panic("potrf answered an eigenvalue error")
     Cholesky(f, failed)
 
 /** What one QR factorisation answered: R above the diagonal and the reflectors below it, and their
@@ -77,6 +81,57 @@ platform_qr[T: Real + Scalar](a: []const T, m: usize, n: usize) -> Qr[T]
     val tau: Buf[T] = buf_filled(min(m, n), T.zero())
     _ = qr_inplace(MatrixView.of(f.view(), m, n).unwrap(), tau.view()).unwrap()
     Qr(f, tau)
+
+// The platform's `?syev`. The lapack binding binds the divide-and-conquer `?syevd` for its `eigh` but not
+// the QL/QR driver slapack implements, so the two are declared here; the binding's own link directive
+// brings in the library.
+@needs(os) extern "dsyev_" dsyev(jobz: *u8, uplo: *u8, n: *i32, a: *f64, lda: *i32, w: *f64, work: *f64, lwork: *i32, info: *i32, jobz_len: usize, uplo_len: usize)
+@needs(os) extern "ssyev_" ssyev(jobz: *u8, uplo: *u8, n: *i32, a: *f32, lda: *i32, w: *f32, work: *f32, lwork: *i32, info: *i32, jobz_len: usize, uplo_len: usize)
+
+/** The element types the platform's `?syev` is declared for. */
+trait Syev
+    platform_syev(jobz: *u8, uplo: *u8, n: *i32, a: *Self, lda: *i32, w: *Self, work: *Self, lwork: *i32, info: *i32)
+
+impl Syev for f64
+    platform_syev(jobz: *u8, uplo: *u8, n: *i32, a: *f64, lda: *i32, w: *f64, work: *f64, lwork: *i32, info: *i32) = dsyev(jobz, uplo, n, a, lda, w, work, lwork, info, 1, 1)
+
+impl Syev for f32
+    platform_syev(jobz: *u8, uplo: *u8, n: *i32, a: *f32, lda: *i32, w: *f32, work: *f32, lwork: *i32, info: *i32) = ssyev(jobz, uplo, n, a, lda, w, work, lwork, info, 1, 1)
+
+/** What one symmetric eigenproblem answered: the matrix it left (the eigenvectors, for `Vectors`), the
+ * eigenvalues, and how many off-diagonal elements did not converge.
+ */
+struct Eig[T]
+    vectors: Buf[T]
+    values: Buf[T]
+    unconverged: usize
+
+/** slapack's syev of the order-`n` column-major matrix in `a`, from its `uplo` triangle. */
+slapack_eig[T: Real](eigen: Eigen, uplo: Uplo, a: []const T, n: usize) -> Eig[T]
+    val f: Buf[T] = buf_filled(a.len, T.zero())
+    for i in 0..<a.len do f[i] = a[i]
+    val w: Buf[T] = buf_filled(n, T.zero())
+    val left = syev_alloc(eigen, uplo, matrix_mut(f.view(), n, n, if n == 0 then 1 else n), w.view()) match
+        Ok(_) -> 0
+        Err(NoConvergence(k)) -> k
+        Err(_) -> panic("syev answered a factorisation's error")
+    Eig(f, w, left)
+
+/** The platform's syev of the same matrix. */
+platform_eig[T: Real + Syev](eigen: Eigen, uplo: Uplo, a: []const T, n: usize) -> Eig[T]
+    val f: Buf[T] = buf_filled(a.len, T.zero())
+    for i in 0..<a.len do f[i] = a[i]
+    val w: Buf[T] = buf_filled(n, T.zero())
+    var jobz = if eigen == Eigen.Vectors then u8('V') else u8('N')
+    var tri = if uplo == Uplo.Lower then u8('L') else u8('U')
+    var order = i32(n)
+    var ld = i32(if n == 0 then 1 else n)
+    var info: i32 = 0
+    // A generous workspace in place of the query: the blocked reduction's n (nb + 2), nb ≤ 64.
+    val work: Buf[T] = buf_filled(max(66 * n, 1), T.zero())
+    T.platform_syev(&jobz, &tri, &order, as_mut_ptr(f.view()), &ld, as_mut_ptr(w.view()), as_mut_ptr(work.view()), &i32(work.len()), &info)
+    assert(info >= 0, "the platform's syev refused an argument")
+    Eig(f, w, usize(info))
 
 /** The platform's potrf of the same matrix, its `info` brought to slapack's terms. */
 platform_chol[T: Real + Scalar](uplo: Uplo, a: []const T, n: usize) -> Cholesky[T]

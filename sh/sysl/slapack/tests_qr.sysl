@@ -38,18 +38,18 @@ private apply_qr[T: Real](side: Side, trans: Transpose, a: Matrix[T], tau: []con
     ormqr(side, trans, a, tau, c, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
 
 /** A copy of `s`. */
-private copy_of[T: Real](s: []const T) -> Buf[T]
+private[slapack] copy_of[T: Real](s: []const T) -> Buf[T]
     val c: Buf[T] = buf_filled(s.len, T.zero())
     for i in 0..<s.len do c[i] = s[i]
     c
 
 /** `r / (scale ε)`, or `r` itself where the scale is zero. */
-private ratio_of[T: Real](r: T, scale: T) -> T = if scale == T.zero() then r else r / (scale * T.epsilon())
+private[slapack] ratio_of[T: Real](r: T, scale: T) -> T = if scale == T.zero() then r else r / (scale * T.epsilon())
 
 /** Whether every element of the column-major storage `s` outside its `m` x `n` matrix of leading
  * dimension `ld` is still NaN.
  */
-private padding_kept[T: Real](s: []const T, m: usize, n: usize, ld: usize) -> bool
+private[slapack] padding_kept[T: Real](s: []const T, m: usize, n: usize, ld: usize) -> bool
     for j in 0..<n
         for i in m..<ld
             if !s[i + j * ld].is_nan() then return false
@@ -79,7 +79,7 @@ private qr_ratio[T: Real](a: Matrix[T], q: Matrix[T], f: Matrix[T]) -> T
     ratio_of(norm1(m, n, diff), T(max1(m, n)) * norm1(m, n, (i, j) -> a.at(i, j)))
 
 /** ‖I − Qᵀ Q‖₁ / (m ε) for the `m` x `n` Q in `q`. */
-private orth_ratio[T: Real](q: Matrix[T]) -> T
+private[slapack] orth_ratio[T: Real](q: Matrix[T]) -> T
     val n = q.cols
     val diff = (i: usize, j: usize) ->
         var s = if i == j then T.one() else T.zero()

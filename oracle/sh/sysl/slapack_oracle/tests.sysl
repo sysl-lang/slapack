@@ -3,6 +3,7 @@ module sh.sysl.slapack_oracle
 
 import sh.sysl.lapack.Scalar
 import sh.sysl.sblas.{Real, Uplo}
+import sh.sysl.slapack.Eigen
 import sysl.buf.{Buf, buf_filled}
 
 /** A deterministic stream of matrix elements in [-1, 1], from a 64-bit xorshift. */
@@ -180,6 +181,83 @@ oracle_geqrf_zero_columns()
     _ = agree_qr[f64](130, 100, cols[..], 1)
     val first: [1]usize = [0]
     _ = agree_qr[f32](20, 20, first[..], 2)
+
+/** A random symmetric order-`n` matrix, both triangles, column-major. */
+private symmetric[T: Real](n: usize, seed: u64) -> Buf[T]
+    var g = Stream(seed)
+    val a: Buf[T] = buf_filled(n * n, T.zero())
+    for j in 0..<n
+        for i in j..<n
+            val x = g.next[T]()
+            a[i + j * n] = x
+            a[j + i * n] = x
+    a
+
+/** Solves one random symmetric matrix of order `n` from `uplo` by slapack's syev and the platform's,
+ * values and vectors, and checks that they agree: every eigenvalue within `64 · n · ε · ‖A‖₁`, the
+ * values alone the same, and each eigenvector, up to its sign, within that over the eigenvalue's gap
+ * to its nearest neighbour — the bound on how far rounding can turn an eigenvector.
+ */
+private agree_eig[T: Real + Syev](uplo: Uplo, n: usize, seed: u64)
+    val a = symmetric[T](n, seed)
+    val mine = slapack_eig(Eigen.Vectors, uplo, a.view(), n)
+    val theirs = platform_eig(Eigen.Vectors, uplo, a.view(), n)
+    assert(mine.unconverged == 0 && theirs.unconverged == 0, s"an iteration did not converge at $n")
+    var norm = T.zero()
+    for j in 0..<n
+        var sum = T.zero()
+        for i in 0..<n do sum = sum + a[i + j * n].abs()
+        if sum > norm then norm = sum
+    val tol = T(64 * n) * T.epsilon() * norm
+    for i in 0..<n
+        val d = (mine.values[i] - theirs.values[i]).abs()
+        assert(d <= tol, s"eigenvalue $i differs by ${f64(d)} at $n")
+    for j in 0..<n
+        var gap = T.max_value()
+        if j > 0 then gap = theirs.values[j] - theirs.values[j - 1]
+        if j + 1 < n && theirs.values[j + 1] - theirs.values[j] < gap then gap = theirs.values[j + 1] - theirs.values[j]
+        var dot = T.zero()
+        for i in 0..<n do dot = dot + mine.vectors[i + j * n] * theirs.vectors[i + j * n]
+        val sign = if dot < T.zero() then -T.one() else T.one()
+        val vtol = if tol / gap < T.one() then tol / gap else T.one()
+        for i in 0..<n
+            val d = (mine.vectors[i + j * n] - sign * theirs.vectors[i + j * n]).abs()
+            assert(d <= vtol, s"eigenvector $j differs by ${f64(d)} in row $i at $n, its gap ${f64(gap)}")
+    val only = slapack_eig(Eigen.Values, uplo, a.view(), n)
+    val their_only = platform_eig(Eigen.Values, uplo, a.view(), n)
+    assert(only.unconverged == 0 && their_only.unconverged == 0)
+    for i in 0..<n
+        val d = (only.values[i] - their_only.values[i]).abs()
+        assert(d <= tol, s"eigenvalue $i alone differs by ${f64(d)} at $n")
+
+private sweep_eig[T: Real + Syev]()
+    for uplo in [Uplo.Lower, Uplo.Upper]
+        for n in 1..64
+            agree_eig[T](uplo, n, u64(n))
+        val orders: [4]usize = [65, 100, 128, 129]
+        for n in orders
+            agree_eig[T](uplo, n, u64(n) * 7)
+
+@test("syev agrees with the platform's dsyev from either triangle: values, the values alone, and vectors up to sign, orders 1 to 64 and past orgqr's block")
+oracle_syev_f64()
+    sweep_eig[f64]()
+
+@test("syev agrees with the platform's ssyev from either triangle: values, the values alone, and vectors up to sign, orders 1 to 64 and past orgqr's block")
+oracle_syev_f32()
+    sweep_eig[f32]()
+
+@test("syev and the platform's both answer that the iteration did not converge on a matrix holding a NaN")
+oracle_syev_nan()
+    val n: usize = 10
+    val a = symmetric[f64](n, 9)
+    a[7 + 3 * n] = f64.nan()
+    a[3 + 7 * n] = f64.nan()
+    for uplo in [Uplo.Lower, Uplo.Upper]
+        for eigen in [Eigen.Vectors, Eigen.Values]
+            val mine = slapack_eig(eigen, uplo, a.view(), n)
+            val theirs = platform_eig(eigen, uplo, a.view(), n)
+            assert(mine.unconverged > 0, "slapack's syev converged on a NaN")
+            assert(theirs.unconverged > 0, "the platform's syev converged on a NaN")
 
 @test("potrf names the same failing minor as the platform's, within a block and past one")
 oracle_potrf_not_pd()
