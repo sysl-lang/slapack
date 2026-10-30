@@ -1,0 +1,20 @@
+// A subset of LAPACK written in sysl, over sblas's views and Level 3 routines.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       slapack { git = "github.com/sysl-lang/slapack", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `slapack`; the module a program imports is `sh.sysl.slapack`.
+
+package { name = "slapack", version = "0.1.0", sysl = "0.8.2" }
+optimization = "2"
+
+// `oracle` checks the factorisations against the platform's LAPACK through the `lapack` binding, in a
+// project of its own so that this package links nothing.
+workspace = ["oracle"]
+
+dependencies {
+  sblas { git = "github.com/sysl-lang/sblas", version = "0.3.0" }
+}

@@ -1,0 +1,65 @@
+module sh.sysl.slapack_oracle
+@tests
+
+import sh.sysl.lapack.Scalar
+import sh.sysl.sblas.Real
+import sysl.buf.{Buf, buf_filled}
+
+/** A deterministic stream of matrix elements in [-1, 1], from a 64-bit xorshift. */
+private struct Stream
+    state: u64
+
+impl Stream
+    next[T: Real](*self) -> T
+        self.state ^= self.state << 13
+        self.state ^= self.state >> 7
+        self.state ^= self.state << 17
+        T(int(self.state >> 53) - 1024) / T(1024)
+
+/** Factors one random `m` x `n` matrix both ways, with `zeros` columns zeroed, and checks that the two
+ * agree: the same pivots, the same first zero pivot, and every factor within `64 · max(m, n) · ε` of
+ * the platform's, relative to the largest factor.
+ */
+private agree[T: Real + Scalar](m: usize, n: usize, zeros: []const usize, seed: u64)
+    var g = Stream(seed)
+    val a: Buf[T] = buf_filled(m * n, T.zero())
+    for i in 0..<a.len() do a[i] = g.next[T]()
+    for c in zeros
+        for i in 0..<m do a[i + c * m] = T.zero()
+    val mine = slapack_lu(a.view(), m, n)
+    val theirs = platform_lu(a.view(), m, n)
+    assert(mine.zero == theirs.zero, s"the first zero pivot differs at $m x $n")
+    for i in 0..<mine.ipiv.len()
+        assert(mine.ipiv[i] == theirs.ipiv[i], s"pivot $i differs at $m x $n: ${mine.ipiv[i]} against ${theirs.ipiv[i]}")
+    var most = T.zero()
+    for i in 0..<a.len()
+        if theirs.factors[i].abs() > most then most = theirs.factors[i].abs()
+    val tol = T(64 * (if m > n then m else n)) * T.epsilon() * most
+    for i in 0..<a.len()
+        val d = (mine.factors[i] - theirs.factors[i]).abs()
+        assert(d <= tol, s"factor $i differs by ${f64(d)} at $m x $n")
+
+private sweep[T: Real + Scalar]()
+    val none: [0]usize = []
+    for n in 1..64
+        agree[T](n, n, none[..], u64(n))
+    val shapes: [10](usize, usize) = [(65, 65), (100, 100), (129, 129), (200, 200), (150, 70), (70, 150), (200, 65), (65, 200), (7, 3), (3, 7)]
+    for (m, n) in shapes
+        agree[T](m, n, none[..], u64(m * 1000 + n))
+
+@test("getrf agrees with the platform's dgetrf: pivots and factors, square orders 1 to 64 and blocked, tall and wide shapes")
+oracle_getrf_f64()
+    sweep[f64]()
+
+@test("getrf agrees with the platform's sgetrf: pivots and factors, square orders 1 to 64 and blocked, tall and wide shapes")
+oracle_getrf_f32()
+    sweep[f32]()
+
+@test("getrf names the same first zero pivot as the platform's, within a panel and past one")
+oracle_getrf_singular()
+    val early: [1]usize = [5]
+    agree[f64](40, 40, early[..], 1)
+    val two: [2]usize = [70, 90]
+    agree[f64](120, 120, two[..], 2)
+    val last: [1]usize = [99]
+    agree[f32](100, 100, last[..], 3)

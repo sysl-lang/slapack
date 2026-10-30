@@ -1,0 +1,38 @@
+module sh.sysl.slapack
+@no_alloc
+
+import sh.sysl.sblas.{Real, MatrixMut, swap}
+
+// A subset of LAPACK over sblas's views. A matrix is sblas's `Matrix`/`MatrixMut`, column-major as
+// LAPACK's are and transposed by `a.t()`; the element types are sblas's `Real`, f32 and f64. Scratch
+// storage is the caller's, so the module allocates nothing; `sh.sysl.slapack.heap` holds the forms that
+// allocate it per call.
+
+/** Why a routine could not finish its job on the data it was given. A shape that does not fit — LAPACK's
+ * negative `info` — is a bug in the caller and traps instead, as it does in sblas.
+ */
+enum Error derives Eq
+    /** `U(index, index)` is exactly zero (0-based; LAPACK's `info` is `index + 1`). The factorisation
+     * has still finished: the factors and the pivots are written, and U is singular, so a solve with
+     * them would divide by zero.
+     */
+    Singular(index: usize)
+
+/** Whether a solve is with the matrix itself or with its transpose. */
+enum Transpose
+    /** Solve `A X = B`. */
+    NoTrans
+    /** Solve `Aᵀ X = B`. */
+    Trans
+
+/** LAPACK's `laswp`: for each `k` in `from..<to`, swaps row `k` of `a` with row `ipiv[k]`, in that order
+ * when `forward` and in the reverse order otherwise. The pivots are 0-based and absolute, as `getrf`
+ * writes them; each must name a row of `a`.
+ */
+laswp[T: Real](a: MatrixMut[T], ipiv: []const usize, from: usize, to: usize, forward: bool)
+    assert(from <= to && to <= ipiv.len, "laswp's pivots reach past the pivot array")
+    if a.cols == 0 then return
+    for step in 0..<to - from
+        val k = if forward then from + step else to - 1 - step
+        val p = ipiv[k]
+        if p != k then swap(a.row(k), a.row(p))

@@ -1,0 +1,23 @@
+module sh.sysl.slapack.heap
+
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork}
+import sh.sysl.slapack.{Error, Transpose, getrf, getrf_work_len, getrs, getrs_work_len}
+import sysl.buf.{Buf, buf_filled}
+
+// The routines of sh.sysl.slapack that need scratch storage, in the form that allocates it per call.
+// sh.sysl.slapack itself is `@no_alloc`, so it runs on a board with no heap; this module is the
+// convenience for a program that has one.
+
+/** `getrf`, with its packing buffers allocated for the call and freed after it. */
+getrf_alloc[T: Real](a: MatrixMut[T], ipiv: []usize) -> Result[unit, Error]
+    val len = getrf_work_len[T](a.rows, a.cols)
+    val pa: Buf[T] = buf_filled(len.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.b, T.zero())
+    getrf(a, ipiv, GemmWork(pa.view(), pb.view()))
+
+/** `getrs`, with its packing buffers allocated for the call and freed after it. */
+getrs_alloc[T: Real](trans: Transpose, lu: Matrix[T], ipiv: []const usize, b: MatrixMut[T])
+    val len = getrs_work_len[T](lu.rows, b.cols)
+    val pa: Buf[T] = buf_filled(len.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.b, T.zero())
+    getrs(trans, lu, ipiv, b, GemmWork(pa.view(), pb.view()))

@@ -1,0 +1,37 @@
+module sh.sysl.slapack_oracle
+
+import sh.sysl.blas.MatrixView
+import sh.sysl.lapack.{Scalar, lu_inplace}
+import sh.sysl.sblas.{Real, matrix_mut}
+import sh.sysl.slapack.heap.getrf_alloc
+import sysl.buf.{Buf, buf_filled}
+import sysl.math.min
+
+// slapack's getrf beside the platform's (Accelerate on macOS, OpenBLAS elsewhere), on the same matrix:
+// the same pivots, the same zero pivot, and factors that agree to within rounding.
+
+/** What one factorisation answered: the factors, the pivots 0-based, and the first zero pivot. */
+struct Factored[T]
+    factors: Buf[T]
+    ipiv: Buf[usize]
+    zero: Option[usize]
+
+/** slapack's getrf of the column-major `m` x `n` matrix in `a`. */
+slapack_lu[T: Real](a: []const T, m: usize, n: usize) -> Factored[T]
+    val f: Buf[T] = buf_filled(a.len, T.zero())
+    for i in 0..<a.len do f[i] = a[i]
+    val ipiv: Buf[usize] = buf_filled(min(m, n), 0)
+    val zero = getrf_alloc(matrix_mut(f.view(), m, n, if m == 0 then 1 else m), ipiv.view()) match
+        Ok(_) -> None
+        Err(Singular(j)) -> Some(j)
+    Factored(f, ipiv, zero)
+
+/** The platform's getrf of the same matrix, its 1-based pivots and `info` brought to slapack's terms. */
+platform_lu[T: Real + Scalar](a: []const T, m: usize, n: usize) -> Factored[T]
+    val f: Buf[T] = buf_filled(a.len, T.zero())
+    for i in 0..<a.len do f[i] = a[i]
+    val p: Buf[i32] = buf_filled(min(m, n), 0)
+    val info = lu_inplace(MatrixView.of(f.view(), m, n).unwrap(), p.view()).unwrap()
+    val ipiv: Buf[usize] = buf_filled(p.len(), 0)
+    for i in 0..<p.len() do ipiv[i] = usize(p[i] - 1)
+    Factored(f, ipiv, if info > 0 then Some(usize(info - 1)) else None)

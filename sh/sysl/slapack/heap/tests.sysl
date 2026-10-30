@@ -1,0 +1,45 @@
+module sh.sysl.slapack.heap
+@tests
+
+import sh.sysl.sblas.{matrix, matrix_mut}
+import sh.sysl.slapack.{Error, Transpose}
+import sysl.buf.{Buf, buf_filled}
+
+// The allocating forms agree with the core routines, which tests_lu checks against their definitions;
+// here it is enough that they size the buffers right, past a panel where the core needs them, and pass
+// the answer through.
+
+@test("getrf_alloc and getrs_alloc factor and solve a matrix past a panel, both ways")
+heap_lu_blocked()
+    val n: usize = 100
+    // A diagonally dominant matrix with a known solution of all ones, both ways: row and column sums.
+    val s: Buf[f64] = buf_filled(n * n, 0)
+    for j in 0..<n
+        for i in 0..<n
+            s[i + j * n] = if i == j then f64(4 * n) else f64((i * 7 + j * 3) % 11) - 5
+    val b: Buf[f64] = buf_filled(n, 0)
+    val c: Buf[f64] = buf_filled(n, 0)
+    for j in 0..<n
+        for i in 0..<n
+            b[i] += s[i + j * n]
+            c[j] += s[i + j * n]
+    val ipiv: Buf[usize] = buf_filled(n, 0)
+    assert(getrf_alloc(matrix_mut(s.view(), n, n, n), ipiv.view()) == Ok(()))
+    getrs_alloc(Transpose.NoTrans, matrix(s.view(), n, n, n), ipiv.view(), matrix_mut(b.view(), n, 1, n))
+    getrs_alloc(Transpose.Trans, matrix(s.view(), n, n, n), ipiv.view(), matrix_mut(c.view(), n, 1, n))
+    for i in 0..<n
+        assert((b[i] - 1).abs() < 1e-12 && (c[i] - 1).abs() < 1e-12)
+
+@test("getrf_alloc passes Singular through")
+heap_lu_singular()
+    var s: [4]f32 = [1, 2, 2, 4]
+    var ipiv: [2]usize
+    assert(getrf_alloc(matrix_mut(s[..], 2, 2, 2), ipiv[..]) == Err(Error.Singular(1)))
+
+@test("getrf_alloc and getrs_alloc on empty input need nothing and do nothing")
+heap_lu_empty()
+    var s: [1]f64 = [9]
+    var ipiv: [1]usize = [7]
+    assert(getrf_alloc(matrix_mut(s[0..<0], 0, 3, 1), ipiv[..]) == Ok(()))
+    getrs_alloc(Transpose.NoTrans, matrix(s[0..<0], 0, 0, 1), ipiv[0..<0], matrix_mut(s[0..<0], 0, 2, 1))
+    assert(s[0] == 9 && ipiv[0] == 7)

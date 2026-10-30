@@ -1,0 +1,8 @@
+// The platform's LAPACK, reached through the `lapack` binding, as the oracle sh.sysl.slapack is checked
+// against. A project of its own so that the slapack package itself links nothing.
+package { name = "slapack-oracle", version = "0.0.1", sysl = "0.8.2" }
+optimization = "2"
+dependencies {
+  slapack { workspace = true }
+  lapack { git = "github.com/sysl-lang/lapack", version = "0.1.0" }
+}

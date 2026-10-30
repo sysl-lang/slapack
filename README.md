@@ -1,0 +1,64 @@
+# slapack
+
+A subset of LAPACK written in pure sysl, over the views and Level 3 routines of
+[sblas](https://github.com/sysl-lang/sblas). Module `sh.sysl.slapack`; no C, no allocation in the core,
+and generic over `f32` and `f64`. It is a stressor for the language — blocked factorisations put
+generics, views, aliasing and float semantics under load — and a reference for how dense linear algebra
+reads in sysl. For production work use [lapack](https://github.com/sysl-lang/lapack), the binding to the
+real LAPACK (Accelerate on macOS, OpenBLAS elsewhere).
+
+*An independent sysl package for LAPACK. It is not affiliated with or endorsed by LAPACK's authors or
+trademark holders.*
+
+## The subset
+
+| family | routines | state |
+|---|---|---|
+| LU | `getrf`, `getrs` (and `getf2`, `laswp`) | done, f32 and f64 |
+| Cholesky | `potrf`, `potrs` | planned |
+| QR | `geqrf`, `orgqr` | planned |
+| symmetric eigenproblem | `syev` | planned |
+| singular value decomposition | `gesvd` | planned |
+
+## Use
+
+```hocon
+dependencies {
+  slapack { git = "github.com/sysl-lang/slapack", version = "0.1.0" }
+}
+```
+
+A matrix is sblas's column-major view, so `lda` is the view's and a transpose is `a.t()`. Pivots are
+0-based, and a zero pivot is an `Err` rather than an `info`:
+
+```sysl
+import sh.sysl.sblas.{matrix, matrix_mut}
+import sh.sysl.slapack.{Error, Transpose}
+import sh.sysl.slapack.heap.{getrf_alloc, getrs_alloc}
+
+/** x with A x = b for the 3 x 3 A in `a`, column-major; `a` is left holding A's LU factors. */
+solve3(a: []f64, b: []f64) -> Result[unit, Error]
+    var ipiv: [3]usize
+    getrf_alloc(matrix_mut(a, 3, 3, 3), ipiv[..])?                                  // PA = LU in place
+    getrs_alloc(Transpose.NoTrans, matrix(a, 3, 3, 3), ipiv[..], matrix_mut(b, 3, 1, 3))
+    Ok(())
+
+var a: [9]f64 = [2, 4, -2, 1, -6, 7, 1, 0, 2]          // [2 1 1; 4 -6 0; -2 7 2]
+var b: [3]f64 = [5, -2, 9]
+print(solve3(a[..], b[..]), b)                         // Ok(()) [1, 1, 2]
+
+var s: [4]f64 = [1, 2, 2, 4]                           // [1 2; 2 4] is singular
+var p: [2]usize
+print(getrf_alloc(matrix_mut(s[..], 2, 2, 2), p[..]) == Err(Error.Singular(1)))   // true: U(1, 1) = 0
+```
+
+`getrf` and `getrs` themselves take sblas's `GemmWork` packing buffers, sized by `getrf_work_len` and
+`getrs_work_len`, and allocate nothing; `sh.sysl.slapack.heap` holds the forms that allocate them per
+call. The design, and what the language made easy or hard, is in [DESIGN.md](DESIGN.md).
+
+## Tests
+
+`sysl test .` runs the package's tests against the routines' definitions — hand-factored systems, and
+LAPACK's own residual measures on random matrices of every order from 1 to 64 and past the panel width,
+square, tall and wide — and `oracle/` compares the factors and pivots with the platform's `dgetrf` and
+`sgetrf` through the `lapack` binding.

@@ -1,0 +1,127 @@
+module sh.sysl.slapack
+@no_alloc
+
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, GemmWorkLen, Side, Uplo, Diag, gemm, gemm_work_len, trsm, trsm_work_len, ger, scal, swap, iamax}
+import sysl.math.{min, max}
+
+// The LU factorisation with partial pivoting, PA = LU, and the solve with its factors.
+//
+// `getrf` is LAPACK's right-looking blocked algorithm. Each step factors a panel of `lu_block` columns
+// with the unblocked `getf2`, applies the panel's row interchanges to the columns on either side, solves
+// for the panel's block row of U with `trsm`, and updates the trailing matrix with one `gemm`, which is
+// where nearly all of a large factorisation's flops go.
+
+/** The width of the panel `getrf` factors unblocked: LAPACK's default block size for `getrf`. */
+private[slapack] const lu_block: usize = 64
+
+/** Factors `a` in place by the unblocked algorithm, writing the 0-based pivots into `ipiv`, and answers
+ * the first column whose pivot was exactly zero.
+ */
+private unblocked[T: Real](a: MatrixMut[T], ipiv: []usize) -> Option[usize]
+    val (m, n) = (a.rows, a.cols)
+    var zero: Option[usize] = None
+    for j in 0..<min(m, n)
+        // The pivot is the first element of largest magnitude on or below the diagonal.
+        val p = j + iamax(a.block(j, j, m - j, 1).as_view().col(0)).unwrap()
+        ipiv[j] = p
+        val pivot = a.at(p, j)
+        if pivot != T.zero()
+            if p != j then swap(a.row(j), a.row(p))
+            val l = a.block(j + 1, j, m - j - 1, 1).col(0)
+            // A pivot whose reciprocal would overflow divides instead, as LAPACK's does.
+            if pivot.abs() >= T.safe_min()
+                scal(T.one() / pivot, l)
+            else
+                for i in 0..<l.len do l.set(i, l.at(i) / pivot)
+        elif zero.is_none()
+            zero = Some(j)
+        // The rank-one update of the rows and columns past the pivot.
+        if j + 1 < m && j + 1 < n
+            val rest = a.as_view()
+            ger(-T.one(), rest.block(j + 1, j, m - j - 1, 1).col(0), rest.block(j, j + 1, 1, n - j - 1).row(0), a.block(j + 1, j + 1, m - j - 1, n - j - 1))
+    zero
+
+/** LAPACK's `getf2`: the LU factorisation with partial pivoting of an `m` x `n` A, unblocked.
+ *
+ * On return `a` holds L below the diagonal (its unit diagonal not stored) and U on and above it, and
+ * `ipiv[j]` is the row that row `j` was interchanged with at step `j` (0-based, and never above
+ * row `j`, so `ipiv[j] >= j`), for `j < min(m, n)`. Answers `Singular(j)` for the first `j` with `U(j, j)`
+ * exactly zero, having still finished the factorisation. Traps if `ipiv` holds fewer than
+ * `min(m, n)` pivots.
+ */
+getf2[T: Real](a: MatrixMut[T], ipiv: []usize) -> Result[unit, Error]
+    assert(ipiv.len >= min(a.rows, a.cols), "the pivot array is shorter than min(m, n)")
+    if unblocked(a, ipiv) is Some(j) then return Err(Error.Singular(j))
+    Ok(())
+
+/** How many elements each of the two `GemmWork` buffers `getrf` takes needs, for an `m` x `n` A. A
+ * matrix of `lu_block` columns or rows or fewer is factored unblocked and needs none.
+ */
+getrf_work_len[T: Real](m: usize, n: usize) -> GemmWorkLen
+    if min(m, n) <= lu_block then return GemmWorkLen(0, 0)
+    // The first panel's solve and update are the largest: every later one is narrower and shorter.
+    val solve = trsm_work_len[T](Side.Left, lu_block, n - lu_block)
+    val update = gemm_work_len[T](m - lu_block, n - lu_block, lu_block)
+    GemmWorkLen(max(solve.a, update.a), max(solve.b, update.b))
+
+/** LAPACK's `getrf`: the LU factorisation with partial pivoting of an `m` x `n` A, PA = LU, blocked.
+ *
+ * The result is `getf2`'s — L below the diagonal, U on and above it, `ipiv[j]` the 0-based row that row
+ * `j` was interchanged with — computed panel by panel. `work` holds the packing buffers of the `trsm`
+ * and `gemm` calls, at least `getrf_work_len` long each. Answers `Singular(j)` for the first `j` with
+ * `U(j, j)` exactly zero, having still finished the factorisation. Traps if `ipiv` holds fewer than
+ * `min(m, n)` pivots or `work` is short.
+ */
+getrf[T: Real](a: MatrixMut[T], ipiv: []usize, work: GemmWork[T]) -> Result[unit, Error]
+    val (m, n) = (a.rows, a.cols)
+    val k = min(m, n)
+    assert(ipiv.len >= k, "the pivot array is shorter than min(m, n)")
+    if k <= lu_block then return getf2(a, ipiv)
+    var zero: Option[usize] = None
+    for var j = 0; j < k; j += lu_block
+        val jb = min(k - j, lu_block)
+        if unblocked(a.block(j, j, m - j, jb), ipiv[j..<j + jb]) is Some(z) && zero.is_none()
+            zero = Some(j + z)
+        for i in j..<j + jb do ipiv[i] += j
+        // The panel's interchanges, applied to the columns on its left and on its right.
+        laswp(a.block(0, 0, m, j), ipiv, j, j + jb, true)
+        if j + jb < n
+            val right = n - j - jb
+            laswp(a.block(0, j + jb, m, right), ipiv, j, j + jb, true)
+            // The panel's block row of U: U₁₂ = L₁₁⁻¹ A₁₂.
+            val u12 = a.block(j, j + jb, jb, right)
+            trsm(Side.Left, Uplo.Lower, Diag.Unit, T.one(), a.as_view().block(j, j, jb, jb), u12, work)
+            // The trailing matrix: A₂₂ -= L₂₁ U₁₂.
+            if j + jb < m
+                gemm(-T.one(), a.as_view().block(j + jb, j, m - j - jb, jb), u12.as_view(), T.one(), a.block(j + jb, j + jb, m - j - jb, right), work)
+    if zero is Some(j) then return Err(Error.Singular(j))
+    Ok(())
+
+/** How many elements each of the two `GemmWork` buffers `getrs` takes needs, for an order-`n` A and
+ * `nrhs` right-hand sides.
+ */
+getrs_work_len[T: Real](n: usize, nrhs: usize) -> GemmWorkLen = trsm_work_len[T](Side.Left, n, nrhs)
+
+/** LAPACK's `getrs`: solves `A X = B` (`NoTrans`) or `Aᵀ X = B` (`Trans`) for a square A, in place in
+ * `b`, with the factors and pivots `getrf` wrote for it.
+ *
+ * As in LAPACK, the factors are not checked for a zero on U's diagonal: a solve with the factors of a
+ * singular matrix divides by it. `work` holds `trsm`'s packing buffers, at least `getrs_work_len` long
+ * each. Traps if `lu` is not square, `b`'s rows are not its order, or `ipiv` holds fewer pivots than
+ * that or one past it.
+ */
+getrs[T: Real](trans: Transpose, lu: Matrix[T], ipiv: []const usize, b: MatrixMut[T], work: GemmWork[T])
+    assert(lu.rows == lu.cols, "getrs takes the factors of a square matrix")
+    assert(b.rows == lu.rows, "B's rows are not the matrix's order")
+    assert(ipiv.len >= lu.rows, "the pivot array is shorter than the matrix's order")
+    val n = lu.rows
+    if n == 0 || b.cols == 0 then return
+    trans match
+        NoTrans ->
+            laswp(b, ipiv, 0, n, true)
+            trsm(Side.Left, Uplo.Lower, Diag.Unit, T.one(), lu, b, work)
+            trsm(Side.Left, Uplo.Upper, Diag.NonUnit, T.one(), lu, b, work)
+        Trans ->
+            trsm(Side.Left, Uplo.Lower, Diag.NonUnit, T.one(), lu.t(), b, work)
+            trsm(Side.Left, Uplo.Upper, Diag.Unit, T.one(), lu.t(), b, work)
+            laswp(b, ipiv, 0, n, false)

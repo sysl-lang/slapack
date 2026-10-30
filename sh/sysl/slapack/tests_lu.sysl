@@ -1,0 +1,465 @@
+module sh.sysl.slapack
+@tests
+
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, matrix, matrix_mut}
+import sysl.buf.{Buf, buf_filled}
+import sysl.math.min
+
+/** getrf in buffers of the length getrf_work_len gives. (`sh.sysl.slapack.heap` does this too, and is
+ * tested in its own module, which depends on this one.)
+ */
+private factor[T: Real](a: MatrixMut[T], ipiv: []usize) -> Result[unit, Error]
+    val len = getrf_work_len[T](a.rows, a.cols)
+    val pa: Buf[T] = buf_filled(len.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.b, T.zero())
+    getrf(a, ipiv, GemmWork(pa.view(), pb.view()))
+
+/** getrs in buffers of the length getrs_work_len gives. */
+private solve[T: Real](trans: Transpose, lu: Matrix[T], ipiv: []const usize, b: MatrixMut[T])
+    val len = getrs_work_len[T](lu.rows, b.cols)
+    val pa: Buf[T] = buf_filled(len.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.b, T.zero())
+    getrs(trans, lu, ipiv, b, GemmWork(pa.view(), pb.view()))
+
+// getrf and getrs against their definitions: systems factored and solved by hand, and generated ones
+// checked by LAPACK's own measures — the factorisation residual ‖PA − LU‖ / (n ‖A‖ ε) and the solve
+// residual ‖op(A) X − B‖ / (n ‖A‖ ‖X‖ ε), both in the 1-norm and both under LAPACK's test threshold
+// of 30. Agreement with the platform's LAPACK is in the oracle's tests.
+
+/** A deterministic stream of matrix elements in [-1, 1], from a 64-bit xorshift. */
+private struct Stream
+    state: u64
+
+impl Stream
+    next[T: Real](*self) -> T
+        self.state ^= self.state << 13
+        self.state ^= self.state >> 7
+        self.state ^= self.state << 17
+        T(int(self.state >> 53) - 1024) / T(1024)
+
+/** A fresh column-major `m` x `n` matrix of the stream's elements, in a leading dimension of `ld`, the
+ * padding rows holding `pad`.
+ */
+private random[T: Real](g: *Stream, m: usize, n: usize, ld: usize, pad: T) -> Buf[T]
+    val s: Buf[T] = buf_filled(ld * n, pad)
+    for j in 0..<n
+        for i in 0..<m
+            s[i + j * ld] = g.next[T]()
+    s
+
+/** The 1-norm: the largest column sum of magnitudes. */
+private norm1[T: Real](rows: usize, cols: usize, at: (usize, usize) -> T) -> T
+    var most = T.zero()
+    for j in 0..<cols
+        var sum = T.zero()
+        for i in 0..<rows
+            sum = sum + at(i, j).abs()
+        if sum > most then most = sum
+    most
+
+/** ‖PA − LU‖₁ / (n ‖A‖₁ ε) for `a`, the matrix that was factored, and `f` with `ipiv`, what getrf wrote
+ * for it: P is the pivots' interchanges applied in order, L the unit lower trapezoid below f's
+ * diagonal, U the upper trapezoid on and above it.
+ */
+private factor_ratio[T: Real](a: Matrix[T], f: Matrix[T], ipiv: []const usize) -> T
+    val (m, n) = (a.rows, a.cols)
+    val k = min(m, n)
+    // Row r of PA is row perm[r] of A.
+    val perm: Buf[usize] = buf_filled(m, 0)
+    for i in 0..<m do perm[i] = i
+    for j in 0..<k
+        val here = perm[j]
+        perm[j] = perm[ipiv[j]]
+        perm[ipiv[j]] = here
+    val diff = (i: usize, j: usize) ->
+        var lu = T.zero()
+        for p in 0..<min(i + 1, min(j + 1, k))
+            lu = lu + (if p == i then T.one() else f.at(i, p)) * f.at(p, j)
+        a.at(perm[i], j) - lu
+    val norm = norm1(m, n, (i, j) -> a.at(i, j))
+    val r = norm1(m, n, diff)
+    if norm == T.zero() then r else r / (T(max1(m, n)) * norm * T.epsilon())
+
+private max1(m: usize, n: usize) -> usize = if m > n then m else if n > 0 then n else 1
+
+/** ‖op(A) X − B‖₁ / (n ‖A‖₁ ‖X‖₁ ε). */
+private solve_ratio[T: Real](a: Matrix[T], x: Matrix[T], b: Matrix[T]) -> T
+    val n = a.rows
+    val diff = (i: usize, j: usize) ->
+        var s = T.zero()
+        for p in 0..<n
+            s = s + a.at(i, p) * x.at(p, j)
+        s - b.at(i, j)
+    val r = norm1(n, b.cols, diff)
+    val scale = T(max1(n, n)) * norm1(n, n, (i, j) -> a.at(i, j)) * norm1(n, x.cols, (i, j) -> x.at(i, j)) * T.epsilon()
+    if scale == T.zero() then r else r / scale
+
+private val threshold = 30
+
+/** Factors a random `m` x `n` matrix with padding rows, checks the factorisation residual and that the
+ * padding was not touched, and — when square — solves three right-hand sides both ways and checks those
+ * residuals.
+ */
+private check_random[T: Real](m: usize, n: usize, seed: u64)
+    var g = Stream(seed)
+    var again = Stream(seed)
+    val ld = m + 3
+    val original = random[T](&g, m, n, ld, T.nan())
+    val s = random[T](&again, m, n, ld, T.nan())
+    val k = min(m, n)
+    val ipiv: Buf[usize] = buf_filled(k, 0)
+    val f = matrix_mut(s.view(), m, n, ld)
+    assert(factor(f, ipiv.view()) == Ok(()), "a random matrix came out singular")
+    for j in 0..<n
+        for i in m..<ld
+            assert(s[i + j * ld].is_nan(), "getrf wrote a padding row")
+    for j in 0..<k
+        assert(ipiv[j] >= j && ipiv[j] < m, "a pivot outside the rows it may name")
+    val a = matrix(original.view(), m, n, ld)
+    val ratio = factor_ratio(a, f.as_view(), ipiv.view())
+    assert(ratio < T(threshold), s"‖PA − LU‖ / (n ‖A‖ ε) = ${f64(ratio)} at $m x $n")
+    if m != n then return
+    for trans in [Transpose.NoTrans, Transpose.Trans]
+        val nrhs: usize = 3
+        val b = random[T](&g, n, nrhs, n, T.zero())
+        val x: Buf[T] = buf_filled(n * nrhs, T.zero())
+        for i in 0..<x.len() do x[i] = b[i]
+        solve(trans, f.as_view(), ipiv.view(), matrix_mut(x.view(), n, nrhs, n))
+        val op = if trans == Transpose.NoTrans then a else a.t()
+        val r = solve_ratio(op, matrix(x.view(), n, nrhs, n), matrix(b.view(), n, nrhs, n))
+        assert(r < T(threshold), s"‖op(A) X − B‖ / (n ‖A‖ ‖X‖ ε) = ${f64(r)} at order $n")
+
+private sweep_small[T: Real](seed: u64)
+    for n in 1..64
+        check_random[T](n, n, seed + u64(n))
+
+@test("getrf and getrs on random square matrices of every order 1 to 64: residuals within LAPACK's threshold, f64")
+lu_random_small_f64()
+    sweep_small[f64](1)
+
+@test("getrf and getrs on random square matrices of every order 1 to 64: residuals within LAPACK's threshold, f32")
+lu_random_small_f32()
+    sweep_small[f32](1)
+
+/** Orders and shapes past the panel width, where getrf blocks: one panel and a column more, a panel
+ * edge, two and three panels with ragged ends, and tall and wide matrices whose short side is past a
+ * panel or within one.
+ */
+private sweep_blocked[T: Real](seed: u64)
+    val shapes: [12](usize, usize) = [(65, 65), (97, 97), (128, 128), (129, 129), (200, 200), (150, 70), (70, 150), (200, 65), (65, 200), (130, 3), (3, 130), (300, 100)]
+    for (m, n) in shapes
+        check_random[T](m, n, seed + u64(m * 1000 + n))
+
+@test("getrf blocks past the panel width: square, tall and wide, with getrs on the square ones, f64")
+lu_random_blocked_f64()
+    sweep_blocked[f64](7)
+
+@test("getrf blocks past the panel width: square, tall and wide, with getrs on the square ones, f32")
+lu_random_blocked_f32()
+    sweep_blocked[f32](7)
+
+@test("random non-square matrices within one panel factor to within LAPACK's threshold")
+lu_random_nonsquare()
+    for m in 1..12
+        for n in 1..12
+            check_random[f64](m, n, u64(m * 100 + n))
+            check_random[f32](m, n, u64(m * 100 + n))
+
+// --- Hand-checked systems ---------------------------------------------------------------------------
+
+private work0() -> GemmWork[f64]
+    var w: [1]f64
+    GemmWork(w[0..<0], w[0..<0])
+
+@test("a 3 x 3 system factored and solved by hand, both ways: the pivots, L, U and x exactly")
+lu_by_hand()
+    // A = [2 1 1; 4 -6 0; -2 7 2]. Step 0 takes row 1 (4); L's column is [1/2, -1/2]; the rows below
+    // become [4 1] and [4 2]. Step 1 keeps row 1 (the first 4), L₂₁ = 1, and U₂₂ = 2 - 1 = 1.
+    var s: [9]f64 = [2, 4, -2, 1, -6, 7, 1, 0, 2]
+    var ipiv: [3]usize
+    assert(getrf(matrix_mut(s[..], 3, 3, 3), ipiv[..], work0()) == Ok(()))
+    assert(ipiv[0] == 1 && ipiv[1] == 1 && ipiv[2] == 2)
+    val want: [9]f64 = [4, 0.5, -0.5, -6, 4, 1, 0, 1, 1]
+    for i in 0..<9
+        assert(s[i] == want[i], "the factors are not the hand-computed ones")
+    // A x = [5, -2, 9] has x = [1, 1, 2].
+    var b: [3]f64 = [5, -2, 9]
+    getrs(Transpose.NoTrans, matrix(s[..], 3, 3, 3), ipiv[..], matrix_mut(b[..], 3, 1, 3), work0())
+    assert(b[0] == 1 && b[1] == 1 && b[2] == 2)
+    // Aᵀ x = [4, 2, 3] has x = [1, 1, 1].
+    var c: [3]f64 = [4, 2, 3]
+    getrs(Transpose.Trans, matrix(s[..], 3, 3, 3), ipiv[..], matrix_mut(c[..], 3, 1, 3), work0())
+    assert(c[0] == 1 && c[1] == 1 && c[2] == 1)
+
+@test("a system that needs pivoting: a zero, and a tiny value, in the first pivot's place")
+lu_needs_pivoting()
+    // [0 1; 1 1] x = [1, 3] has x = [2, 1]; without an interchange the first step divides by zero.
+    var s: [4]f64 = [0, 1, 1, 1]
+    var ipiv: [2]usize
+    assert(getrf(matrix_mut(s[..], 2, 2, 2), ipiv[..], work0()) == Ok(()))
+    assert(ipiv[0] == 1 && ipiv[1] == 1)
+    var b: [2]f64 = [1, 3]
+    getrs(Transpose.NoTrans, matrix(s[..], 2, 2, 2), ipiv[..], matrix_mut(b[..], 2, 1, 2), work0())
+    assert(b[0] == 2 && b[1] == 1)
+    // [1e-20 1; 1 1] x = [1, 2] has x ≈ [1, 1]; without pivoting U₂₂ = 1 - 1e20 and x₁ comes out 0.
+    var t: [4]f64 = [1e-20, 1, 1, 1]
+    assert(getrf(matrix_mut(t[..], 2, 2, 2), ipiv[..], work0()) == Ok(()))
+    assert(ipiv[0] == 1)
+    var c: [2]f64 = [1, 2]
+    getrs(Transpose.NoTrans, matrix(t[..], 2, 2, 2), ipiv[..], matrix_mut(c[..], 2, 1, 2), work0())
+    assert((c[0] - 1).abs() < 1e-15 && (c[1] - 1).abs() < 1e-15)
+
+@test("a wide 2 x 3 and a tall 3 x 2 matrix factored by hand")
+lu_nonsquare_by_hand()
+    // [1 2 3; 4 5 6]: row 1 first, L₂₁ = 1/4, U's second row [3/4, 3/2].
+    var w: [6]f64 = [1, 4, 2, 5, 3, 6]
+    var ipiv: [2]usize
+    assert(getrf(matrix_mut(w[..], 2, 3, 2), ipiv[..], work0()) == Ok(()))
+    assert(ipiv[0] == 1 && ipiv[1] == 1)
+    val want_w: [6]f64 = [4, 0.25, 5, 0.75, 6, 1.5]
+    for i in 0..<6
+        assert(w[i] == want_w[i])
+    // [1 4; 2 5; 4 6]: row 2 first (4), L = [1/2, 1/4]; the rest of column 1 is [2, 5/2], so step 1
+    // takes row 2 again and interchanges L's rows as well: L₂₁ = 1/4, L₃₁ = 1/2, L₃₂ = 2 / (5/2).
+    var t: [6]f64 = [1, 2, 4, 4, 5, 6]
+    assert(getrf(matrix_mut(t[..], 3, 2, 3), ipiv[..], work0()) == Ok(()))
+    assert(ipiv[0] == 2 && ipiv[1] == 2)
+    assert(t[0] == 4 && t[1] == 0.25 && t[2] == 0.5 && t[3] == 6 && t[4] == 2.5)
+    assert((t[5] - 0.8).abs() < 1e-15)
+
+@test("a subnormal pivot, whose reciprocal overflows, divides the column instead of scaling it")
+lu_subnormal_pivot()
+    // [2⁻¹⁰⁷⁰ 1; 2⁻¹⁰⁷² 1]: L₂₁ = 1/4 and U₂₂ = 3/4; scaling by 2¹⁰⁷⁰ would give an infinity.
+    var s: [4]f64 = [0x1p-1070, 0x1p-1072, 1, 1]
+    var ipiv: [2]usize
+    assert(getf2(matrix_mut(s[..], 2, 2, 2), ipiv[..]) == Ok(()))
+    assert(ipiv[0] == 0 && s[1] == 0.25 && s[3] == 0.75)
+    var t: [4]f32 = [0x1p-147, 0x1p-149, 1, 1]
+    assert(getf2(matrix_mut(t[..], 2, 2, 2), ipiv[..]) == Ok(()))
+    assert(ipiv[0] == 0 && t[1] == 0.25 && t[3] == 0.75)
+
+// --- Singular matrices ------------------------------------------------------------------------------
+
+@test("a singular matrix answers Singular naming the first zero pivot, and still factors")
+lu_singular()
+    // [1 2; 2 4]: row 1 first, L₂₁ = 1/2, U₂₂ = 2 - 2 = 0.
+    var s: [4]f64 = [1, 2, 2, 4]
+    var ipiv: [2]usize
+    assert(getrf(matrix_mut(s[..], 2, 2, 2), ipiv[..], work0()) == Err(Error.Singular(1)))
+    assert(ipiv[0] == 1 && s[0] == 2 && s[1] == 0.5 && s[2] == 4 && s[3] == 0)
+    // A zero first column: Singular(0), and the second column is still factored, pivoting on its 3.
+    var z: [6]f64 = [0, 0, 0, 1, 3, 2]
+    var p3: [3]usize
+    assert(getrf(matrix_mut(z[..], 3, 2, 3), p3[..], work0()) == Err(Error.Singular(0)))
+    assert(p3[0] == 0 && p3[1] == 1 && z[3] == 1 && z[4] == 3 && z[5] == 2.0 / 3)
+    // The all-zero matrix: Singular(0) and nothing interchanged.
+    var e: [4]f64
+    assert(getf2(matrix_mut(e[..], 2, 2, 2), ipiv[..]) == Err(Error.Singular(0)))
+    assert(ipiv[0] == 0 && ipiv[1] == 1)
+
+/** A random order-`n` matrix whose columns `zeros` are zero: each stays exactly zero through every
+ * update, so the first of them is the first zero pivot, and the factorisation still holds.
+ */
+private check_zero_columns[T: Real](n: usize, zeros: []const usize, seed: u64)
+    var g = Stream(seed)
+    val s = random[T](&g, n, n, n, T.zero())
+    for c in zeros
+        for i in 0..<n do s[i + c * n] = T.zero()
+    val original: Buf[T] = buf_filled(n * n, T.zero())
+    for i in 0..<s.len() do original[i] = s[i]
+    val ipiv: Buf[usize] = buf_filled(n, 0)
+    val f = matrix_mut(s.view(), n, n, n)
+    assert(factor(f, ipiv.view()) == Err(Error.Singular(zeros[0])))
+    val ratio = factor_ratio(matrix(original.view(), n, n, n), f.as_view(), ipiv.view())
+    assert(ratio < T(threshold), s"a singular factorisation's residual is ${f64(ratio)}")
+
+@test("Singular names the first zero pivot in the blocked path: in the first panel, a later one, and the first of two")
+lu_singular_blocked()
+    val first: [1]usize = [10]
+    check_zero_columns[f64](100, first[..], 3)
+    val later: [1]usize = [80]
+    check_zero_columns[f64](100, later[..], 4)
+    val two: [2]usize = [70, 90]
+    check_zero_columns[f64](150, two[..], 5)
+    val last: [1]usize = [129]
+    check_zero_columns[f32](130, last[..], 6)
+
+@test("the Singular error carries LAPACK's info as its index plus one, and compares by index")
+lu_singular_info()
+    assert(Error.Singular(3) == Error.Singular(3))
+    assert(Error.Singular(3) != Error.Singular(4))
+    if Error.Singular(3) is Singular(i)
+        assert(i + 1 == 4)
+
+// --- Empty input ------------------------------------------------------------------------------------
+
+@test("an empty matrix factors to Ok, writing no pivot, and an empty solve touches nothing")
+lu_empty()
+    var s: [4]f64 = [9, 9, 9, 9]
+    var ipiv: [2]usize = [7, 7]
+    assert(getrf(matrix_mut(s[0..<0], 0, 0, 1), ipiv[..], work0()) == Ok(()))
+    assert(getrf(matrix_mut(s[0..<0], 0, 5, 1), ipiv[..], work0()) == Ok(()))
+    assert(getrf(matrix_mut(s[0..<0], 5, 0, 5), ipiv[..], work0()) == Ok(()))
+    assert(getf2(matrix_mut(s[0..<0], 0, 0, 1), ipiv[0..<0]) == Ok(()))
+    assert(ipiv[0] == 7 && ipiv[1] == 7)
+    // A 0 x 0 system, and an order-2 system with no right-hand side.
+    getrs(Transpose.NoTrans, matrix(s[0..<0], 0, 0, 1), ipiv[0..<0], matrix_mut(s[0..<0], 0, 3, 1), work0())
+    var lu: [4]f64 = [2, 0.5, 1, 1]
+    var p: [2]usize = [0, 1]
+    getrs(Transpose.Trans, matrix(lu[..], 2, 2, 2), p[..], matrix_mut(s[..], 2, 0, 2), work0())
+    for v in s
+        assert(v == 9)
+    // An empty matrix needs no workspace.
+    val len = getrf_work_len[f64](0, 100)
+    assert(len.a == 0 && len.b == 0)
+
+// --- Views as input ---------------------------------------------------------------------------------
+
+@test("getrf and getrs on blocks of a larger matrix leave everything outside the blocks alone")
+lu_submatrix_views()
+    // A 3 x 3 block at (2, 1) of a 7 x 6 matrix of NaN, holding the hand-checked system above.
+    val ld: usize = 7
+    var s: [42]f64
+    for i in 0..<42 do s[i] = f64.nan()
+    val big = matrix_mut(s[..], 7, 6, ld)
+    val a = big.block(2, 1, 3, 3)
+    val vals: [9]f64 = [2, 4, -2, 1, -6, 7, 1, 0, 2]
+    for j in 0..<3
+        for i in 0..<3
+            a.set(i, j, vals[i + 3 * j])
+    var ipiv: [3]usize
+    assert(getrf(a, ipiv[..], work0()) == Ok(()))
+    assert(ipiv[0] == 1 && ipiv[1] == 1 && ipiv[2] == 2)
+    assert(a.at(1, 0) == 0.5 && a.at(2, 2) == 1)
+    for j in 0..<6
+        for i in 0..<7
+            if !(i >= 2 && i < 5 && j >= 1 && j < 4) then assert(s[i + ld * j].is_nan(), "getrf wrote outside its block")
+    // The right-hand side is column 5 of the same storage, rows 2 to 4.
+    val b = big.block(2, 5, 3, 1)
+    b.set(0, 0, 5)
+    b.set(1, 0, -2)
+    b.set(2, 0, 9)
+    getrs(Transpose.NoTrans, a.as_view(), ipiv[..], b, work0())
+    assert(b.at(0, 0) == 1 && b.at(1, 0) == 1 && b.at(2, 0) == 2)
+    assert(s[1 + ld * 5].is_nan() && s[5 + ld * 5].is_nan(), "getrs wrote outside its block")
+
+@test("getrf on a row-major view, the transpose of column-major storage, factors the same matrix")
+lu_row_major_view()
+    // The storage of Aᵀ, viewed through t(): the same A = [2 1 1; 4 -6 0; -2 7 2].
+    var s: [9]f64 = [2, 1, 1, 4, -6, 0, -2, 7, 2]
+    var ipiv: [3]usize
+    val a = matrix_mut(s[..], 3, 3, 3).t()
+    assert(getrf(a, ipiv[..], work0()) == Ok(()))
+    assert(ipiv[0] == 1 && ipiv[1] == 1 && ipiv[2] == 2)
+    val want: [9]f64 = [4, 0.5, -0.5, -6, 4, 1, 0, 1, 1]
+    for j in 0..<3
+        for i in 0..<3
+            assert(a.at(i, j) == want[i + 3 * j])
+
+@test("a blocked factorisation of a block of a larger matrix agrees bit for bit with the same matrix on its own")
+lu_blocked_block_view()
+    val n: usize = 100
+    var g = Stream(11)
+    val alone = random[f64](&g, n, n, n, 0)
+    val ld: usize = 130
+    val big: Buf[f64] = buf_filled(ld * (n + 5), f64.nan())
+    for j in 0..<n
+        for i in 0..<n
+            big[(i + 20) + (j + 5) * ld] = alone[i + j * n]
+    val p1: Buf[usize] = buf_filled(n, 0)
+    val p2: Buf[usize] = buf_filled(n, 0)
+    assert(factor(matrix_mut(alone.view(), n, n, n), p1.view()) == Ok(()))
+    assert(factor(matrix_mut(big.view(), ld, n + 5, ld).block(20, 5, n, n), p2.view()) == Ok(()))
+    for j in 0..<n
+        assert(p1[j] == p2[j])
+        for i in 0..<n
+            assert(alone[i + j * n] == big[(i + 20) + (j + 5) * ld])
+    for i in 0..<20
+        assert(big[i + 5 * ld].is_nan())
+
+// --- The workspace, and what traps ----------------------------------------------------------------
+
+@test("getrf's workspace is nothing within a panel and enough for its largest update past it")
+lu_work_len()
+    val small = getrf_work_len[f64](64, 1000)
+    assert(small.a == 0 && small.b == 0)
+    val big = getrf_work_len[f64](200, 150)
+    assert(big.a > 0 && big.b > 0)
+    // getrf runs in buffers of exactly that length.
+    var g = Stream(2)
+    val s = random[f64](&g, 200, 150, 200, 0)
+    val pa: Buf[f64] = buf_filled(big.a, 0)
+    val pb: Buf[f64] = buf_filled(big.b, 0)
+    val ipiv: Buf[usize] = buf_filled(150, 0)
+    assert(getrf(matrix_mut(s.view(), 200, 150, 200), ipiv.view(), GemmWork(pa.view(), pb.view())) == Ok(()))
+
+@test("getrf traps on a pivot array shorter than min(m, n)", should_trap)
+lu_short_ipiv()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var ipiv: [1]usize
+    _ = getrf(matrix_mut(s[..], 3, 2, 3), ipiv[..], work0())
+
+@test("getf2 traps on a pivot array shorter than min(m, n)", should_trap)
+lu_getf2_short_ipiv()
+    var s: [4]f64 = [1, 2, 3, 4]
+    var ipiv: [1]usize
+    _ = getf2(matrix_mut(s[..], 2, 2, 2), ipiv[..])
+
+@test("getrf traps on packing buffers shorter than getrf_work_len says", should_trap)
+lu_short_work()
+    var g = Stream(2)
+    val s = random[f64](&g, 100, 100, 100, 0)
+    val ipiv: Buf[usize] = buf_filled(100, 0)
+    _ = getrf(matrix_mut(s.view(), 100, 100, 100), ipiv.view(), work0())
+
+@test("getrs traps on factors that are not square", should_trap)
+lu_getrs_not_square()
+    var s: [6]f64 = [1, 2, 3, 4, 5, 6]
+    var b: [2]f64
+    var ipiv: [2]usize
+    getrs(Transpose.NoTrans, matrix(s[..], 2, 3, 2), ipiv[..], matrix_mut(b[..], 2, 1, 2), work0())
+
+@test("getrs traps on a B whose rows are not the matrix's order", should_trap)
+lu_getrs_b_rows()
+    var s: [4]f64 = [1, 0, 0, 1]
+    var b: [3]f64
+    var ipiv: [2]usize = [0, 1]
+    getrs(Transpose.Trans, matrix(s[..], 2, 2, 2), ipiv[..], matrix_mut(b[..], 3, 1, 3), work0())
+
+@test("getrs traps on a pivot array shorter than the matrix's order", should_trap)
+lu_getrs_short_ipiv()
+    var s: [4]f64 = [1, 0, 0, 1]
+    var b: [2]f64
+    var ipiv: [1]usize
+    getrs(Transpose.NoTrans, matrix(s[..], 2, 2, 2), ipiv[..], matrix_mut(b[..], 2, 1, 2), work0())
+
+@test("getrs traps on a pivot that names a row past the matrix", should_trap)
+lu_getrs_pivot_past()
+    var s: [4]f64 = [1, 0, 0, 1]
+    var b: [2]f64
+    var ipiv: [2]usize = [5, 1]
+    getrs(Transpose.NoTrans, matrix(s[..], 2, 2, 2), ipiv[..], matrix_mut(b[..], 2, 1, 2), work0())
+
+// --- laswp ------------------------------------------------------------------------------------------
+
+@test("laswp interchanges rows forward in pivot order and undoes them backward")
+lu_laswp()
+    // Rows [0, 1, 2, 3] of a 4 x 2 matrix; pivots [2, 3, 2]: forward gives rows [2, 3, 0, 1].
+    var s: [8]f64 = [0, 1, 2, 3, 10, 11, 12, 13]
+    val ipiv: [3]usize = [2, 3, 2]
+    val a = matrix_mut(s[..], 4, 2, 4)
+    laswp(a, ipiv[..], 0, 3, true)
+    assert(s[0] == 2 && s[1] == 3 && s[2] == 0 && s[3] == 1)
+    assert(s[4] == 12 && s[5] == 13 && s[6] == 10 && s[7] == 11)
+    laswp(a, ipiv[..], 0, 3, false)
+    for i in 0..<4
+        assert(s[i] == f64(i) && s[i + 4] == f64(i + 10))
+    // A sub-range applies only those steps.
+    laswp(a, ipiv[..], 1, 2, true)
+    assert(s[1] == 3 && s[3] == 1 && s[0] == 0)
+
+@test("laswp traps on a range past the pivot array", should_trap)
+lu_laswp_past()
+    var s: [4]f64
+    val ipiv: [1]usize = [0]
+    laswp(matrix_mut(s[..], 2, 2, 2), ipiv[..], 0, 2, true)
