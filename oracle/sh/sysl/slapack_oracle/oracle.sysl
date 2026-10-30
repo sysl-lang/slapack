@@ -2,9 +2,10 @@ module sh.sysl.slapack_oracle
 
 import sh.sysl.blas.MatrixView
 import sh.sysl.lapack.{Scalar, lu_inplace, chol_inplace, qr_inplace}
+import sh.sysl.lapack.c
 import sh.sysl.sblas.{Real, Uplo, matrix_mut}
-import sh.sysl.slapack.Eigen
-import sh.sysl.slapack.heap.{getrf_alloc, potrf_alloc, geqrf_alloc, syev_alloc}
+import sh.sysl.slapack.{Eigen, SvdJob}
+import sh.sysl.slapack.heap.{getrf_alloc, potrf_alloc, geqrf_alloc, syev_alloc, gesvd_alloc}
 import sysl.buf.{Buf, buf_filled}
 import sysl.math.{min, max}
 import sysl.slices.as_mut_ptr
@@ -132,6 +133,63 @@ platform_eig[T: Real + Syev](eigen: Eigen, uplo: Uplo, a: []const T, n: usize) -
     T.platform_syev(&jobz, &tri, &order, as_mut_ptr(f.view()), &ld, as_mut_ptr(w.view()), as_mut_ptr(work.view()), &i32(work.len()), &info)
     assert(info >= 0, "the platform's syev refused an argument")
     Eig(f, w, usize(info))
+
+/** The element types the platform's `?gesvd` is reached for, through the `lapack` binding's own
+ * declarations of `dgesvd_` and `sgesvd_`.
+ */
+trait Gesvd
+    platform_gesvd(jobu: *u8, jobvt: *u8, m: *i32, n: *i32, a: *Self, lda: *i32, s: *Self, u: *Self, ldu: *i32, vt: *Self, ldvt: *i32, work: *Self, lwork: *i32, info: *i32)
+
+impl Gesvd for f64
+    platform_gesvd(jobu: *u8, jobvt: *u8, m: *i32, n: *i32, a: *f64, lda: *i32, s: *f64, u: *f64, ldu: *i32, vt: *f64, ldvt: *i32, work: *f64, lwork: *i32, info: *i32) = c.dgesvd(jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, info, 1, 1)
+
+impl Gesvd for f32
+    platform_gesvd(jobu: *u8, jobvt: *u8, m: *i32, n: *i32, a: *f32, lda: *i32, s: *f32, u: *f32, ldu: *i32, vt: *f32, ldvt: *i32, work: *f32, lwork: *i32, info: *i32) = c.sgesvd(jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, info, 1, 1)
+
+/** What one singular value decomposition answered: the singular values, the whole of U and Vᵀ (empty
+ * when the values alone were asked for), and how many off-diagonal elements did not converge.
+ */
+struct Sv[T]
+    values: Buf[T]
+    u: Buf[T]
+    vt: Buf[T]
+    unconverged: usize
+
+/** slapack's gesvd of the column-major `m` x `n` matrix in `a`, every vector or none. */
+slapack_svd[T: Real](vectors: bool, a: []const T, m: usize, n: usize) -> Sv[T]
+    val f: Buf[T] = buf_filled(a.len, T.zero())
+    for i in 0..<a.len do f[i] = a[i]
+    val job = if vectors then SvdJob.Full else SvdJob.Omit
+    val (ur, vr) = if vectors then (m, n) else (0, 0)
+    val u: Buf[T] = buf_filled(ur * ur, T.zero())
+    val vt: Buf[T] = buf_filled(vr * vr, T.zero())
+    val s: Buf[T] = buf_filled(min(m, n), T.zero())
+    val left = gesvd_alloc(job, job, matrix_mut(f.view(), m, n, max(m, 1)), s.view(), matrix_mut(u.view(), ur, ur, max(ur, 1)), matrix_mut(vt.view(), vr, vr, max(vr, 1))) match
+        Ok(_) -> 0
+        Err(NoConvergence(k)) -> k
+        Err(_) -> panic("gesvd answered a factorisation's error")
+    Sv(s, u, vt, left)
+
+/** The platform's gesvd of the same matrix. */
+platform_svd[T: Real + Gesvd](vectors: bool, a: []const T, m: usize, n: usize) -> Sv[T]
+    val f: Buf[T] = buf_filled(a.len, T.zero())
+    for i in 0..<a.len do f[i] = a[i]
+    val (ur, vr) = if vectors then (m, n) else (1, 1)
+    val u: Buf[T] = buf_filled(ur * ur, T.zero())
+    val vt: Buf[T] = buf_filled(vr * vr, T.zero())
+    val s: Buf[T] = buf_filled(max(min(m, n), 1), T.zero())
+    var job = if vectors then u8('A') else u8('N')
+    var rows = i32(m)
+    var cols = i32(n)
+    var lda = i32(max(m, 1))
+    var ldu = i32(ur)
+    var ldvt = i32(vr)
+    var info: i32 = 0
+    // A generous workspace in place of the query: the minimum, max(3 min + max, 5 min), with room for blocking.
+    val work: Buf[T] = buf_filled(max(70 * (m + n), 1), T.zero())
+    T.platform_gesvd(&job, &job, &rows, &cols, as_mut_ptr(f.view()), &lda, as_mut_ptr(s.view()), as_mut_ptr(u.view()), &ldu, as_mut_ptr(vt.view()), &ldvt, as_mut_ptr(work.view()), &i32(work.len()), &info)
+    assert(info >= 0, "the platform's gesvd refused an argument")
+    Sv(s, u, vt, usize(info))
 
 /** The platform's potrf of the same matrix, its `info` brought to slapack's terms. */
 platform_chol[T: Real + Scalar](uplo: Uplo, a: []const T, n: usize) -> Cholesky[T]

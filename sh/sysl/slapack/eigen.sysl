@@ -39,7 +39,7 @@ struct SyevWorkLen
 private const max_sweeps: usize = 30
 
 /** The unit roundoff, LAPACK's `dlamch('E')`: half the distance from one to the next float. */
-private unit_roundoff[T: Real]() -> T = T.epsilon() / T(2)
+private[slapack] unit_roundoff[T: Real]() -> T = T.epsilon() / T(2)
 
 /** The largest magnitude among `d` and `e`, LAPACK's `lanst('M')`; a NaN answers NaN. */
 private lanst[T: Real](d: []const T, e: []const T) -> T
@@ -83,7 +83,7 @@ private lascl[T: Real](cfrom: T, cto: T, x: []T)
 /** The plane rotation `[c s; −s c]` with `[c s; −s c] (f, g) = (r, 0)`, LAPACK's `lartg`: `c ≥ 0`, and
  * `r` has `f`'s sign. Answers `(c, s, r)`, scaling where `f² + g²` would overflow or underflow.
  */
-private lartg[T: Real](f: T, g: T) -> (T, T, T)
+private[slapack] lartg[T: Real](f: T, g: T) -> (T, T, T)
     if g == T.zero() then return (T.one(), T.zero(), f)
     if f == T.zero() then return (T.zero(), T.one().copysign(g), g.abs())
     val safmin = T.safe_min()
@@ -213,7 +213,7 @@ sytrd[T: Real](uplo: Uplo, a: MatrixMut[T], d: []T, e: []T, tau: []T, work: []T)
     tridiagonalise(lower_of(uplo, a), d, e, tau, work)
 
 /** Q in place of the reflectors in the lower triangle of `l`, LAPACK's `orgtr` from `Lower`. */
-private form_tridiagonal_q[T: Real](l: MatrixMut[T], tau: []const T, work: QrWork[T])
+private[slapack] form_tridiagonal_q[T: Real](l: MatrixMut[T], tau: []const T, work: QrWork[T])
     val n = l.rows
     if n == 0 then return
     // Each reflector moves one column right, so that the reflectors of the order n − 1 block from
@@ -278,7 +278,7 @@ private block_end[T: Real](d: []const T, e: []T, l1: usize, eps: T) -> usize
     n - 1
 
 /** How many of `e`'s elements are not zero: LAPACK's `info` when the iteration runs out of sweeps. */
-private unconverged[T: Real](e: []const T) -> usize
+private[slapack] unconverged[T: Real](e: []const T) -> usize
     var count: usize = 0
     for x in e
         if x != T.zero() then count += 1

@@ -5,6 +5,7 @@ import sh.sysl.lapack.Scalar
 import sh.sysl.sblas.{Real, Uplo}
 import sh.sysl.slapack.Eigen
 import sysl.buf.{Buf, buf_filled}
+import sysl.math.{min, max}
 
 /** A deterministic stream of matrix elements in [-1, 1], from a 64-bit xorshift. */
 private struct Stream
@@ -267,3 +268,92 @@ oracle_potrf_not_pd()
         agree_chol[f64](uplo, 150, Some(64), 3)
         agree_chol[f64](uplo, 150, Some(120), 4)
         agree_chol[f32](uplo, 100, Some(99), 5)
+
+/** A random column-major `m` x `n` matrix. */
+private rectangular[T: Real](m: usize, n: usize, seed: u64) -> Buf[T]
+    var g = Stream(seed)
+    val a: Buf[T] = buf_filled(m * n, T.zero())
+    for i in 0..<m * n do a[i] = g.next[T]()
+    a
+
+/** Decomposes one random `m` x `n` matrix by slapack's gesvd and the platform's, with every vector and
+ * with none, and checks that they agree: every singular value within `64 · max(m, n) · ε · ‖A‖₁`, the
+ * values alone the same, and each of the first min(m, n) columns of U and rows of Vᵀ, up to a sign the
+ * pair shares, within that over the value's gap to its nearest neighbour — and to zero, where U or V has
+ * vectors past min(m, n) — the bound on how far rounding can turn a singular vector.
+ */
+private agree_svd[T: Real + Gesvd](m: usize, n: usize, seed: u64)
+    val a = rectangular[T](m, n, seed)
+    val at = s"$m x $n"
+    val k = min(m, n)
+    val mine = slapack_svd(true, a.view(), m, n)
+    val theirs = platform_svd(true, a.view(), m, n)
+    assert(mine.unconverged == 0 && theirs.unconverged == 0, s"an iteration did not converge at $at")
+    var norm = T.zero()
+    for j in 0..<n
+        var sum = T.zero()
+        for i in 0..<m do sum = sum + a[i + j * m].abs()
+        if sum > norm then norm = sum
+    val tol = T(64 * max(m, n)) * T.epsilon() * norm
+    for i in 0..<k
+        val d = (mine.values[i] - theirs.values[i]).abs()
+        assert(d <= tol, s"singular value $i differs by ${f64(d)} at $at")
+    for j in 0..<k
+        val sv = theirs.values
+        var gap = if m != n then sv[j] else T.max_value()
+        if j > 0 && sv[j - 1] - sv[j] < gap then gap = sv[j - 1] - sv[j]
+        if j + 1 < k && sv[j] - sv[j + 1] < gap then gap = sv[j] - sv[j + 1]
+        var dot = T.zero()
+        for i in 0..<m do dot = dot + mine.u[i + j * m] * theirs.u[i + j * m]
+        val sign = if dot < T.zero() then -T.one() else T.one()
+        val vtol = if tol / gap < T.one() then tol / gap else T.one()
+        for i in 0..<m
+            val d = (mine.u[i + j * m] - sign * theirs.u[i + j * m]).abs()
+            assert(d <= vtol, s"U's column $j differs by ${f64(d)} in row $i at $at, its gap ${f64(gap)}")
+        for i in 0..<n
+            val d = (mine.vt[j + i * n] - sign * theirs.vt[j + i * n]).abs()
+            assert(d <= vtol, s"Vᵀ's row $j differs by ${f64(d)} in column $i at $at, its gap ${f64(gap)}")
+    val only = slapack_svd(false, a.view(), m, n)
+    val their_only = platform_svd(false, a.view(), m, n)
+    assert(only.unconverged == 0 && their_only.unconverged == 0)
+    for i in 0..<k
+        val d = (only.values[i] - their_only.values[i]).abs()
+        assert(d <= tol, s"singular value $i alone differs by ${f64(d)} at $at")
+
+private sweep_svd[T: Real + Gesvd]()
+    for n in 1..64
+        agree_svd[T](n, n, u64(n))
+    val orders: [4]usize = [65, 100, 128, 129]
+    for n in orders
+        agree_svd[T](n, n, u64(n) * 11)
+    val shapes: [8](usize, usize) = [(150, 70), (70, 150), (200, 65), (65, 200), (130, 3), (3, 130), (300, 100), (100, 300)]
+    for (m, n) in shapes
+        agree_svd[T](m, n, u64(m * n))
+
+@test("gesvd agrees with the platform's dgesvd: values, the values alone, and U and Vᵀ up to sign, square orders 1 to 64 and past orgqr's block, tall and wide shapes")
+oracle_gesvd_f64()
+    sweep_svd[f64]()
+
+@test("gesvd agrees with the platform's sgesvd: values, the values alone, and U and Vᵀ up to sign, square orders 1 to 64 and past orgqr's block, tall and wide shapes")
+oracle_gesvd_f32()
+    sweep_svd[f32]()
+
+@test("on a matrix holding a NaN slapack's gesvd answers that the iteration did not converge from either job; the platform's does with the vectors, and without them answers success")
+oracle_gesvd_nan()
+    val shapes: [2](usize, usize) = [(10, 7), (7, 10)]
+    for (m, n) in shapes
+        val a = rectangular[f64](m, n, 13)
+        a[4 + 3 * m] = f64.nan()
+        for vectors in [true, false]
+            val mine = slapack_svd(vectors, a.view(), m, n)
+            val theirs = platform_svd(vectors, a.view(), m, n)
+            assert(mine.unconverged > 0, s"slapack's gesvd converged on a NaN at $m x $n")
+            // Without vectors the platform's runs dqds (dlasq1), whose dlascl refuses the NaN scale through
+            // xerbla — printed, not fatal — and gesvd then answers info = 0 (observed on macOS, sysl 0.8.3).
+            if vectors
+                assert(theirs.unconverged > 0, s"the platform's gesvd converged on a NaN at $m x $n")
+            else
+                assert(theirs.unconverged == 0, s"the platform's gesvd of the values now reports a NaN at $m x $n")
+                var nan = false
+                for i in 0..<min(m, n) do nan = nan || theirs.values[i].is_nan()
+                assert(nan, s"the platform's values hold no NaN at $m x $n")

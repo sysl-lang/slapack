@@ -48,7 +48,7 @@ private work_len[T: Real](rows: usize, cols: usize, k: usize) -> QrWorkLen
     QrWorkLen(qr_block * qr_block + cols * qr_block, GemmWorkLen(max(w.a, c.a), max(w.b, c.b)))
 
 /** Whether `work` is at least `need` long in each buffer. */
-private fits[T](work: QrWork[T], need: QrWorkLen) -> bool = work.block.len >= need.block && work.gemm.a.len >= need.gemm.a && work.gemm.b.len >= need.gemm.b
+private[slapack] fits[T](work: QrWork[T], need: QrWorkLen) -> bool = work.block.len >= need.block && work.gemm.a.len >= need.gemm.a && work.gemm.b.len >= need.gemm.b
 
 /** The `k` x `k` triangular factor and the `cols` x `k` product of a block reflector, laid out in the
  * `block` workspace.
@@ -104,7 +104,7 @@ larfg[T: Real](alpha: T, x: StridedMut[T]) -> (T, T)
 /** LAPACK's `larf`, from the left: C := H C for H = I − τ v vᵀ, v = (1, `tail`). `w` holds Cᵀ v and is
  * at least `c.cols` long. A τ of zero is the identity and touches nothing.
  */
-private larf[T: Real](tau: T, tail: Strided[T], c: MatrixMut[T], w: []T)
+private[slapack] larf[T: Real](tau: T, tail: Strided[T], c: MatrixMut[T], w: []T)
     if tau == T.zero() || c.cols == 0 then return
     val n = c.cols
     val below = c.rows - 1

@@ -1,0 +1,516 @@
+module sh.sysl.slapack
+@no_alloc
+
+import sh.sysl.sblas.{Real, MatrixMut, GemmWorkLen, matrix_mut, rot, scal, swap}
+import sysl.math.{min, max}
+
+// The singular value decomposition, A = U Σ Vᵀ, by LAPACK's path: `gebrd` reduces A to a bidiagonal
+// B = Qᵀ A P by Householder reflections from either side, `orgbr` forms Q and Pᵀ, and `bdsqr`
+// diagonalises B by the implicit QR iteration of Demmel and Kahan — zero-shifted where a shift would
+// cost the small singular values their relative accuracy — carrying its rotations into U and Vᵀ.
+//
+// Every reflection is applied from the left, as in QR: one from the right is the left one of the
+// transposed view. A wide A is decomposed as its transpose, Aᵀ = V Σ Uᵀ, so the iteration only ever
+// sees an upper bidiagonal B and U and Vᵀ trade places; LAPACK reduces a wide A to a lower bidiagonal
+// instead, so its U and Vᵀ may differ from these in the signs of their vectors, and the singular values
+// do not.
+
+/** Which of U's or Vᵀ's singular vectors `gesvd` forms: LAPACK's `jobu` and `jobvt`. */
+enum SvdJob
+    /** None of them: the matrix given for them is not referenced. */
+    Omit
+    /** The first min(m, n): U is m x min(m, n), and Vᵀ is min(m, n) x n. */
+    Thin
+    /** All of them: U is m x m, and Vᵀ is n x n. */
+    Full
+
+/** Which orthogonal factor of `gebrd`'s reduction `orgbr` forms: LAPACK's `vect`. */
+enum Reflectors
+    /** Q, from the reflectors `gebrd` applied from the left and `tauq`. */
+    Q
+    /** Pᵀ, from the reflectors `gebrd` applied from the right and `taup`. */
+    P
+
+/** The scratch storage of `gesvd`. `bidiag` holds the bidiagonal form's off-diagonal, the reflectors'
+ * scales and `gebrd`'s vector; `qr` is `orgbr`'s workspace, empty when no vectors are formed.
+ * `gesvd_work_len` says how long each must be.
+ */
+struct SvdWork[T]
+    bidiag: []T
+    qr: QrWork[T]
+
+/** How many elements each buffer of an `SvdWork` needs. */
+struct SvdWorkLen
+    bidiag: usize
+    qr: QrWorkLen
+
+/** LAPACK's `maxitr`: the iteration gives up after this many times n² inner steps. */
+private const svd_sweeps: usize = 6
+
+/** The upper bidiagonal reduction of an `m` x `n` A with `m >= n`, LAPACK's `gebd2`: H(i) zeroes column
+ * `i` below the diagonal and is applied to the columns right of it, then G(i) zeroes row `i` right of the
+ * superdiagonal and is applied to the rows below it. `w` is at least `m` long.
+ */
+private bidiagonalise[T: Real](a: MatrixMut[T], d: []T, e: []T, tauq: []T, taup: []T, w: []T)
+    val (m, n) = (a.rows, a.cols)
+    val at = a.t()
+    for i in 0..<n
+        val (beta, tq) = larfg(a.at(i, i), a.block(i + 1, i, m - i - 1, 1).col(0))
+        d[i] = beta
+        tauq[i] = tq
+        a.set(i, i, beta)
+        if i + 1 == n
+            taup[i] = T.zero()
+            break
+        larf(tq, a.as_view().block(i + 1, i, m - i - 1, 1).col(0), a.block(i, i + 1, m - i, n - i - 1), w)
+        // G(i) from the right on A's rows below i is G(i) from the left on those columns of Aᵀ.
+        val (gamma, tp) = larfg(a.at(i, i + 1), at.block(i + 2, i, n - i - 2, 1).col(0))
+        e[i] = gamma
+        taup[i] = tp
+        a.set(i, i + 1, gamma)
+        larf(tp, at.as_view().block(i + 2, i, n - i - 2, 1).col(0), at.block(i + 1, i + 1, n - i - 1, m - i - 1), w)
+
+/** How long the work vector `gebrd` takes must be, for an `m` x `n` A: one vector of max(m, n). */
+gebrd_work_len[T: Real](m: usize, n: usize) -> usize = if m == 0 || n == 0 then 0 else max(m, n)
+
+/** LAPACK's `gebrd`: reduces the `m` x `n` A to bidiagonal form, Qᵀ A P = B, by Householder reflections
+ * from either side, unblocked (LAPACK's `gebd2`).
+ *
+ * B's diagonal goes to `d[0..<k]`, `k = min(m, n)`, and its off-diagonal to `e[0..<k − 1]`; both are also
+ * left in `a`. With `m >= n` B is upper bidiagonal: Q = H(0) … H(k−1), each H(i)'s reflector below the
+ * diagonal of column `i`, and P = G(0) … G(k−2), each G(i)'s right of the superdiagonal in row `i`. With
+ * `m < n` B is lower bidiagonal: Q = H(0) … H(k−2), the reflectors below the subdiagonal, and P = G(0) …
+ * G(k−1), right of the diagonal — LAPACK's layout in both cases, computed as the upper reduction of
+ * `a.t()`. The scales go to `tauq[0..<k]` and `taup[0..<k]`, the unused last one zero. `work` is at least
+ * `gebrd_work_len` long. Traps if a slice is short.
+ */
+gebrd[T: Real](a: MatrixMut[T], d: []T, e: []T, tauq: []T, taup: []T, work: []T)
+    val k = min(a.rows, a.cols)
+    assert(d.len >= k && tauq.len >= k && taup.len >= k, "d, tauq or taup is shorter than min(m, n)")
+    assert(e.len + 1 >= k, "e is shorter than min(m, n) less one")
+    assert(work.len >= gebrd_work_len[T](a.rows, a.cols), "gebrd's work is shorter than gebrd_work_len says")
+    if a.rows >= a.cols then bidiagonalise(a, d, e, tauq, taup, work) else bidiagonalise(a.t(), d, e, taup, tauq, work)
+
+/** How long each buffer of the `QrWork` that `orgbr` takes must be, for an `m` x `n` result from the
+ * reduction of a matrix with `k` columns (`Q`) or rows (`P`): `orgqr`'s, for the reflectors as they lie.
+ */
+orgbr_work_len[T: Real](vect: Reflectors, m: usize, n: usize, k: usize) -> QrWorkLen
+    if vect == Reflectors.Q
+        if m >= k then orgqr_work_len[T](m, n, k) else orgtr_work_len[T](m)
+    else
+        if k < n then orgqr_work_len[T](n, m, k) else orgtr_work_len[T](n)
+
+/** LAPACK's `orgbr`: one orthogonal factor of `gebrd`'s reduction, in place of the reflectors `gebrd`
+ * left in `a`.
+ *
+ * With `Q`, `a` is `m` x `n` and the reduced matrix had `k` columns: for `m >= k`, Q's first `n` columns,
+ * `k <= n <= m`, from the `k` reflectors below the diagonal (`orgqr`); for `m < k`, the whole order-`m`
+ * Q from the `m − 1` reflectors below the subdiagonal. With `P`, `a` is `m` x `n` and the reduced matrix
+ * had `k` rows: for `k < n`, Pᵀ's first `m` rows, `k <= m <= n`, from the `k` reflectors right of the
+ * diagonal; for `k >= n`, the whole order-`n` Pᵀ from the `n − 1` reflectors right of the
+ * superdiagonal. Reads only the reflectors and their scales `tau[0..<min(m, k)]` (`Q`) or
+ * `tau[0..<min(n, k)]` (`P`), and overwrites all of `a`. `work` is at least `orgbr_work_len` long in each
+ * buffer. Traps if the shape is not one of these, or if `tau` or `work` is short.
+ */
+orgbr[T: Real](vect: Reflectors, a: MatrixMut[T], k: usize, tau: []const T, work: QrWork[T])
+    val (m, n) = (a.rows, a.cols)
+    assert(fits(work, orgbr_work_len[T](vect, m, n, k)), "orgbr's workspace is shorter than orgbr_work_len says")
+    if vect == Reflectors.Q
+        assert(tau.len >= min(m, k), "tau is shorter than min(m, k)")
+        if m >= k
+            orgqr(a, tau[0..<k], work)
+            return
+        assert(n == m, "Q from the reduction of a wide matrix is square")
+        if m > 0 then form_tridiagonal_q(a, tau[0..<m - 1], work)
+    else
+        assert(tau.len >= min(n, k), "tau is shorter than min(n, k)")
+        // Pᵀ's rows are the columns of P, which is formed in the view `a.t()`.
+        if k < n
+            orgqr(a.t(), tau[0..<k], work)
+            return
+        assert(m == n, "Pᵀ from the reduction of a tall matrix is square")
+        if n > 0 then form_tridiagonal_q(a.t(), tau[0..<n - 1], work)
+
+/** The smaller singular value of the upper triangular `[f g; 0 h]`, LAPACK's `las2`, without overflow
+ * or harmful underflow. It is only ever a shift, so an error in it slows the iteration and changes
+ * nothing it answers; the tests check it on its own.
+ */
+private[slapack] las2[T: Real](f: T, g: T, h: T) -> T
+    val (fa, ga, ha) = (f.abs(), g.abs(), h.abs())
+    val (fhmn, fhmx) = (min(fa, ha), max(fa, ha))
+    if fhmn == T.zero() then return T.zero()
+    // sa and ta are 1 ± fhmn / fhmx.
+    val sa = T.one() + fhmn / fhmx
+    val ta = (fhmx - fhmn) / fhmx
+    if ga < fhmx
+        val au = (ga / fhmx) * (ga / fhmx)
+        return fhmn * (T(2) / ((sa * sa + au).sqrt() + (ta * ta + au).sqrt()))
+    val au = fhmx / ga
+    // The true value may not underflow even where `au` does.
+    if au == T.zero() then return (fhmn * fhmx) / ga
+    val c = T.one() / ((T.one() + (sa * au) * (sa * au)).sqrt() + (T.one() + (ta * au) * (ta * au)).sqrt())
+    val ssmin = (fhmn * c) * au
+    ssmin + ssmin
+
+/** The singular value decomposition of the upper triangular `[f g; 0 h]`, LAPACK's `lasv2`: answers
+ * `(ssmin, ssmax, snr, csr, snl, csl)` with
+ * `[csl snl; −snl csl] [f g; 0 h] [csr −snr; snr csr] = [ssmax 0; 0 ssmin]`, `|ssmax| >= |ssmin|`. The
+ * two values carry the signs that make this hold, and are accurate to a few units in the last place.
+ */
+private lasv2[T: Real](f: T, g: T, h: T) -> (T, T, T, T, T, T)
+    val swapped = h.abs() > f.abs()
+    // ft is the larger of the two diagonal elements in magnitude, ht the other.
+    val (ft, ht) = if swapped then (h, f) else (f, h)
+    val (fa, ha) = (ft.abs(), ht.abs())
+    val gt = g
+    val ga = gt.abs()
+    var pmax = if swapped then 3 else 1
+    var ssmin = ha
+    var ssmax = fa
+    var (clt, crt, slt, srt) = (T.one(), T.one(), T.zero(), T.zero())
+    if ga != T.zero()
+        var small_g = true
+        if ga > fa
+            pmax = 2
+            if fa / ga < unit_roundoff[T]()
+                // A very large g.
+                small_g = false
+                ssmax = ga
+                ssmin = if ha > T.one() then fa / (ga / ha) else (fa / ga) * ha
+                clt = T.one()
+                slt = ht / gt
+                srt = T.one()
+                crt = ft / gt
+        if small_g
+            val two = T(2)
+            val d = fa - ha
+            // Copes with an infinite f or h.
+            var l = if d == fa then T.one() else d / fa
+            val mv = gt / ft
+            var t = two - l
+            val mm = mv * mv
+            val tt = t * t
+            val s = (tt + mm).sqrt()
+            val r = if l == T.zero() then mv.abs() else (l * l + mm).sqrt()
+            val a = (s + r) / two
+            ssmin = ha / a
+            ssmax = fa * a
+            if mm == T.zero()
+                // mv is very tiny.
+                t = if l == T.zero() then two.copysign(ft) * T.one().copysign(gt) else gt / d.copysign(ft) + mv / t
+            else
+                t = (mv / (s + t) + mv / (r + l)) * (T.one() + a)
+            l = (t * t + T(4)).sqrt()
+            crt = two / l
+            srt = t / l
+            clt = (crt + srt * mv) / a
+            slt = (ht / ft) * srt / a
+    val (csl, snl, csr, snr) = if swapped then (srt, crt, slt, clt) else (clt, slt, crt, srt)
+    // The signs of the two values.
+    val one = T.one()
+    val tsign = if pmax == 1 then one.copysign(csr) * one.copysign(csl) * one.copysign(f) else if pmax == 2 then one.copysign(snr) * one.copysign(csl) * one.copysign(g) else one.copysign(snr) * one.copysign(snl) * one.copysign(h)
+    (ssmin.copysign(tsign * one.copysign(f) * one.copysign(h)), ssmax.copysign(tsign), snr, csr, snl, csl)
+
+/** Rows `i` and `i + 1` of `vt` := `[c s; −s c]` times them. */
+private turn_rows[T: Real](vt: MatrixMut[T], i: usize, c: T, s: T)
+    if vt.cols > 0 then rot(vt.row(i), vt.row(i + 1), c, s)
+
+/** Columns `i` and `i + 1` of `u` := them times `[c −s; s c]`. */
+private turn_cols[T: Real](u: MatrixMut[T], i: usize, c: T, s: T)
+    if u.rows > 0 then rot(u.col(i), u.col(i + 1), c, s)
+
+/** The QR iteration of `bdsqr` on the upper bidiagonal B of diagonal `d` and superdiagonal `e`,
+ * `e.len = d.len − 1 >= 1`, until every element of `e` is zero. Answers how many are not zero when the
+ * iteration gives up, and zero when it converged.
+ */
+private iterate[T: Real](d: []T, e: []T, vt: MatrixMut[T], u: MatrixMut[T]) -> usize
+    val n = d.len
+    val eps = unit_roundoff[T]()
+    val hundredth = T.one() / T(100)
+    // LAPACK's tolmul, ε^(−1/8) kept within [10, 100], times ε: the relative accuracy sought.
+    val tol = max(T(10), min(T(100), T.one() / eps.sqrt().sqrt().sqrt())) * eps
+    // An estimate of the smallest singular value, which sets the absolute threshold below which an
+    // off-diagonal element is negligible.
+    var sminoa = d[0].abs()
+    if sminoa != T.zero()
+        var mu = sminoa
+        for i in 1..<n
+            mu = d[i].abs() * (mu / (mu + e[i - 1].abs()))
+            sminoa = min(sminoa, mu)
+            if sminoa == T.zero() then break
+    sminoa = sminoa / T(n).sqrt()
+    val thresh = max(tol * sminoa, T(svd_sweeps) * (T(n) * (T(n) * T.safe_min())))
+    val maxit = svd_sweeps * n * n
+    var iter: usize = 0
+    var oldll: int = -1
+    var oldm: int = -1
+    var forward = true
+    // d[m] is the last element of the part not yet converged.
+    var m = n - 1
+    while m > 0
+        if iter > maxit then return unconverged(e)
+        // The block to work on, e[ll..<m] not negligible and e[ll − 1] zero.
+        var smax = d[m].abs()
+        var ll: usize = 0
+        for step in 1..m
+            val i = m - step
+            val abse = e[i].abs()
+            if abse <= thresh
+                e[i] = T.zero()
+                ll = i + 1
+                break
+            smax = max(smax, max(d[i].abs(), abse))
+        if ll == m
+            // d[m] has converged.
+            m -= 1
+            continue
+        if ll + 1 == m
+            // A 2 x 2 block is solved outright.
+            val (sigmn, sigmx, sinr, cosr, sinl, cosl) = lasv2(d[m - 1], e[m - 1], d[m])
+            d[m - 1] = sigmx
+            e[m - 1] = T.zero()
+            d[m] = sigmn
+            turn_rows(vt, m - 1, cosr, sinr)
+            turn_cols(u, m - 1, cosl, sinl)
+            if m < 2 then break
+            m -= 2
+            continue
+        // A new block is chased from its larger end of the diagonal towards the smaller.
+        if int(ll) > oldm || int(m) < oldll then forward = d[ll].abs() >= d[m].abs()
+        // The convergence tests, which may split the block, estimating its smallest singular value.
+        var smin = T.zero()
+        var split = false
+        if forward
+            if e[m - 1].abs() <= tol * d[m].abs()
+                e[m - 1] = T.zero()
+                continue
+            var mu = d[ll].abs()
+            smin = mu
+            for i in ll..<m
+                if e[i].abs() <= tol * mu
+                    e[i] = T.zero()
+                    split = true
+                    break
+                mu = d[i + 1].abs() * (mu / (mu + e[i].abs()))
+                smin = min(smin, mu)
+        else
+            if e[ll].abs() <= tol * d[ll].abs()
+                e[ll] = T.zero()
+                continue
+            var mu = d[m].abs()
+            smin = mu
+            for step in 0..<m - ll
+                val i = m - 1 - step
+                if e[i].abs() <= tol * mu
+                    e[i] = T.zero()
+                    split = true
+                    break
+                mu = d[i].abs() * (mu / (mu + e[i].abs()))
+                smin = min(smin, mu)
+        if split then continue
+        oldll = int(ll)
+        oldm = int(m)
+        // The shift, from the 2 x 2 at the far end — zero where it would cost relative accuracy.
+        var shift = T.zero()
+        if !(T(n) * tol * (smin / smax) <= max(eps, hundredth * tol))
+            val sll = if forward then d[ll].abs() else d[m].abs()
+            shift = if forward then las2(d[m - 1], e[m - 1], d[m]) else las2(d[ll], e[ll], d[ll + 1])
+            if sll > T.zero() && (shift / sll) * (shift / sll) < eps then shift = T.zero()
+        iter += m - ll
+        if shift == T.zero()
+            // The zero-shift QR sweep of Demmel and Kahan, which keeps every value's relative accuracy.
+            var cs = T.one()
+            var sn = T.zero()
+            var oldcs = T.one()
+            var oldsn = T.zero()
+            var r = T.zero()
+            if forward
+                for i in ll..<m
+                    (cs, sn, r) = lartg(d[i] * cs, e[i])
+                    if i > ll then e[i - 1] = oldsn * r
+                    (oldcs, oldsn, d[i]) = lartg(oldcs * r, d[i + 1] * sn)
+                    turn_rows(vt, i, cs, sn)
+                    turn_cols(u, i, oldcs, oldsn)
+                val h = d[m] * cs
+                d[m] = h * oldcs
+                e[m - 1] = h * oldsn
+                if e[m - 1].abs() <= thresh then e[m - 1] = T.zero()
+            else
+                for step in 0..<m - ll
+                    val i = m - step
+                    (cs, sn, r) = lartg(d[i] * cs, e[i - 1])
+                    if i < m then e[i] = oldsn * r
+                    (oldcs, oldsn, d[i]) = lartg(oldcs * r, d[i - 1] * sn)
+                    turn_rows(vt, i - 1, oldcs, -oldsn)
+                    turn_cols(u, i - 1, cs, -sn)
+                val h = d[ll] * cs
+                d[ll] = h * oldcs
+                e[ll] = h * oldsn
+                if e[ll].abs() <= thresh then e[ll] = T.zero()
+        else if forward
+            // The shifted QR sweep, chasing the bulge from the top.
+            var f = (d[ll].abs() - shift) * (T.one().copysign(d[ll]) + shift / d[ll])
+            var g = e[ll]
+            for i in ll..<m
+                val (cosr, sinr, r) = lartg(f, g)
+                if i > ll then e[i - 1] = r
+                f = cosr * d[i] + sinr * e[i]
+                e[i] = cosr * e[i] - sinr * d[i]
+                g = sinr * d[i + 1]
+                d[i + 1] = cosr * d[i + 1]
+                val (cosl, sinl, rl) = lartg(f, g)
+                d[i] = rl
+                f = cosl * e[i] + sinl * d[i + 1]
+                d[i + 1] = cosl * d[i + 1] - sinl * e[i]
+                if i + 1 < m
+                    g = sinl * e[i + 1]
+                    e[i + 1] = cosl * e[i + 1]
+                turn_rows(vt, i, cosr, sinr)
+                turn_cols(u, i, cosl, sinl)
+            e[m - 1] = f
+            if e[m - 1].abs() <= thresh then e[m - 1] = T.zero()
+        else
+            // The shifted QR sweep, chasing the bulge from the bottom.
+            var f = (d[m].abs() - shift) * (T.one().copysign(d[m]) + shift / d[m])
+            var g = e[m - 1]
+            for step in 0..<m - ll
+                val i = m - step
+                val (cosr, sinr, r) = lartg(f, g)
+                if i < m then e[i] = r
+                f = cosr * d[i] + sinr * e[i - 1]
+                e[i - 1] = cosr * e[i - 1] - sinr * d[i]
+                g = sinr * d[i - 1]
+                d[i - 1] = cosr * d[i - 1]
+                val (cosl, sinl, rl) = lartg(f, g)
+                d[i] = rl
+                f = cosl * e[i - 1] + sinl * d[i - 1]
+                d[i - 1] = cosl * d[i - 1] - sinl * e[i - 1]
+                if i > ll + 1
+                    g = sinl * e[i - 2]
+                    e[i - 2] = cosl * e[i - 2]
+                turn_rows(vt, i - 1, cosl, -sinl)
+                turn_cols(u, i - 1, cosr, -sinr)
+            e[ll] = f
+            if e[ll].abs() <= thresh then e[ll] = T.zero()
+    0
+
+/** LAPACK's `bdsqr` for an upper bidiagonal B: its singular values, B = Q Σ Pᵀ, by the implicit QR
+ * iteration of Demmel and Kahan, with Pᵀ carried into the rows of `vt` and Q into the columns of `u`.
+ *
+ * B has diagonal `d` and superdiagonal `e[0..<n − 1]`, `n = d.len`. On return `d` holds the singular
+ * values, non-negative and in descending order, `vt` is Pᵀ times the `vt` given and `u` the `u` given
+ * times Q: given `orgbr`'s Pᵀ and Q, the singular vectors of A; given identities, those of B. `vt` has
+ * `n` rows and `u` has `n` columns, and either may be empty the other way (`n` x 0, 0 x `n`) to leave
+ * those vectors out. Each rotation is applied as it is made, in the order LAPACK's `lasr` applies the
+ * saved ones, so no workspace is needed. `e` is destroyed. Answers `NoConvergence(k)` when, after 6 n²
+ * inner steps, `k` elements of `e` are still not zero; `d` is then neither sorted nor made positive.
+ * Traps if `e` is short or `vt` or `u` is the wrong shape.
+ */
+bdsqr[T: Real](d: []T, e: []T, vt: MatrixMut[T], u: MatrixMut[T]) -> Result[unit, Error]
+    val n = d.len
+    assert(e.len + 1 >= n, "e is shorter than B's order less one")
+    assert(vt.rows == n, "Vᵀ's rows are not B's order")
+    assert(u.cols == n, "U's columns are not B's order")
+    if n == 0 then return Ok(())
+    if n > 1
+        val left = iterate(d, e[0..<n - 1], vt, u)
+        if left > 0 then return Err(Error.NoConvergence(left))
+    // Every value non-negative, its row of Vᵀ taking the sign.
+    for i in 0..<n
+        if d[i] < T.zero()
+            d[i] = -d[i]
+            if vt.cols > 0 then scal(-T.one(), vt.row(i))
+    // Descending, by selection so that each vector moves at most once.
+    for i in 0..<n - 1
+        val last = n - 1 - i
+        var k: usize = 0
+        var smin = d[0]
+        for j in 1..last
+            if d[j] <= smin
+                k = j
+                smin = d[j]
+        if k != last
+            d[k] = d[last]
+            d[last] = smin
+            if vt.cols > 0 then swap(vt.row(k), vt.row(last))
+            if u.rows > 0 then swap(u.col(k), u.col(last))
+    Ok(())
+
+/** How long each buffer of the `SvdWork` that `gesvd` takes must be, for an `m` x `n` A: `bidiag` holds
+ * the off-diagonal, both reflectors' scales and `gebrd`'s vector, 3 min(m, n) − 1 + max(m, n); `qr` is
+ * the larger of `orgbr`'s for the vectors asked for, and empty for neither.
+ */
+gesvd_work_len[T: Real](jobu: SvdJob, jobvt: SvdJob, m: usize, n: usize) -> SvdWorkLen
+    // In the terms of the tall problem a wide A is solved as: its transpose, U and Vᵀ trading places.
+    val (rows, cols, left, right) = if m >= n then (m, n, jobu, jobvt) else (n, m, jobvt, jobu)
+    val none = QrWorkLen(0, GemmWorkLen(0, 0))
+    if cols == 0 then return SvdWorkLen(0, none)
+    val q = if left == SvdJob.Omit then none else orgbr_work_len[T](Reflectors.Q, rows, if left == SvdJob.Full then rows else cols, cols)
+    val p = if right == SvdJob.Omit then none else orgbr_work_len[T](Reflectors.P, cols, cols, cols)
+    SvdWorkLen(3 * cols - 1 + rows, QrWorkLen(max(q.block, p.block), GemmWorkLen(max(q.gemm.a, p.gemm.a), max(q.gemm.b, p.gemm.b))))
+
+/** `gesvd` for `m >= n`. */
+private decompose[T: Real](jobu: SvdJob, jobvt: SvdJob, a: MatrixMut[T], s: []T, u: MatrixMut[T], vt: MatrixMut[T], work: SvdWork[T]) -> Result[unit, Error]
+    val (m, n) = (a.rows, a.cols)
+    if n == 0
+        // No singular values; a whole U is still orthogonal.
+        if jobu == SvdJob.Full
+            for j in 0..<m
+                for i in 0..<m do u.set(i, j, if i == j then T.one() else T.zero())
+        return Ok(())
+    // Scale a matrix whose largest element is outside [√safmin / ε, ε / √safmin] into it.
+    var anrm = T.zero()
+    for j in 0..<n
+        for i in 0..<m
+            val x = a.at(i, j).abs()
+            if x.is_nan() || x > anrm then anrm = x
+    val smlnum = T.safe_min().sqrt() / T.epsilon()
+    val bignum = T.one() / smlnum
+    val sigma = if anrm > T.zero() && anrm < smlnum then smlnum / anrm else if anrm > bignum then bignum / anrm else T.one()
+    if sigma != T.one()
+        for j in 0..<n do scal(sigma, a.col(j))
+    val e = work.bidiag[0..<n - 1]
+    val tauq = work.bidiag[n - 1..<2 * n - 1]
+    val taup = work.bidiag[2 * n - 1..<3 * n - 1]
+    bidiagonalise(a, s[0..<n], e, tauq, taup, work.bidiag[3 * n - 1..<3 * n - 1 + m])
+    if jobu != SvdJob.Omit
+        // Q from the reflectors below A's diagonal.
+        for j in 0..<n
+            for i in j + 1..<m do u.set(i, j, a.at(i, j))
+        orgbr(Reflectors.Q, u, n, tauq, work.qr)
+    if jobvt != SvdJob.Omit
+        // Pᵀ from the reflectors right of A's superdiagonal.
+        for i in 0..<max(n, 2) - 2
+            for j in i + 2..<n do vt.set(i, j, a.at(i, j))
+        orgbr(Reflectors.P, vt, n, taup, work.qr)
+    val none = work.bidiag[0..<0]
+    val pt = if jobvt == SvdJob.Omit then matrix_mut(none, n, 0, n) else vt
+    val q = if jobu == SvdJob.Omit then matrix_mut(none, 0, n, 1) else u.block(0, 0, m, n)
+    val result = bdsqr(s[0..<n], e, pt, q)
+    if sigma != T.one()
+        for i in 0..<n do s[i] = s[i] / sigma
+    result
+
+/** LAPACK's `gesvd`: the singular values of the `m` x `n` A, A = U Σ Vᵀ, and as asked its left and right
+ * singular vectors.
+ *
+ * The singular values go to `s[0..<k]`, `k = min(m, n)`, non-negative and in descending order. With
+ * `Thin` `u` is m x k and receives the first k columns of U, with `Full` it is m x m and receives all of
+ * U; likewise `vt` is k x n or n x n and receives the rows of Vᵀ; with `Omit` neither is referenced. A
+ * is destroyed. A matrix whose largest element is too small or too large for the iteration is scaled
+ * first and its singular values scaled back, as LAPACK does. `work` is at least `gesvd_work_len` long in
+ * each buffer. Answers `NoConvergence(k)` when `bdsqr` did not converge — `s` then holds the diagonal it
+ * reached — which a NaN in the matrix also gives. With no singular values, a `Full` U or Vᵀ is set to
+ * the identity, which LAPACK leaves alone. Traps if `s`, `u`, `vt` or `work` is the wrong size.
+ */
+gesvd[T: Real](jobu: SvdJob, jobvt: SvdJob, a: MatrixMut[T], s: []T, u: MatrixMut[T], vt: MatrixMut[T], work: SvdWork[T]) -> Result[unit, Error]
+    val (m, n) = (a.rows, a.cols)
+    val k = min(m, n)
+    assert(s.len >= k, "s is shorter than min(m, n)")
+    if jobu != SvdJob.Omit then assert(u.rows == m && u.cols == (if jobu == SvdJob.Full then m else k), "U is not m x min(m, n) for Thin, or m x m for Full")
+    if jobvt != SvdJob.Omit then assert(vt.cols == n && vt.rows == (if jobvt == SvdJob.Full then n else k), "Vᵀ is not min(m, n) x n for Thin, or n x n for Full")
+    val need = gesvd_work_len[T](jobu, jobvt, m, n)
+    assert(work.bidiag.len >= need.bidiag, "gesvd's bidiag workspace is shorter than gesvd_work_len says")
+    assert(fits(work.qr, need.qr), "gesvd's qr workspace is shorter than gesvd_work_len says")
+    // A wide A is its transpose's tall problem, Aᵀ = V Σ Uᵀ, whose U is the view vt.t() and whose Vᵀ is u.t().
+    if m >= n then decompose(jobu, jobvt, a, s, u, vt, work) else decompose(jobvt, jobu, a.t(), s, vt.t(), u.t(), work)

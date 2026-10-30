@@ -18,7 +18,7 @@ trademark holders.*
 | Cholesky | `potrf`, `potrs` (and `potf2`) | done, f32 and f64 |
 | QR | `geqrf`, `orgqr`, `ormqr` (and `geqr2`, `org2r`, `larfg`) | done, f32 and f64 |
 | symmetric eigenproblem | `syev` (and `sytrd`, `orgtr`, `steqr`, `sterf`) | done, f32 and f64 |
-| singular value decomposition | `gesvd` | planned |
+| singular value decomposition | `gesvd` (and `gebrd`, `orgbr`, `bdsqr`) | done, f32 and f64 |
 
 ## Use
 
@@ -112,10 +112,35 @@ print(syev_alloc(Eigen.Values, Uplo.Upper, matrix_mut(b[..], 3, 3, 3), w[..]), w
 That is 2 − √2, 2 and 2 + √2, the first with the eigenvector (1, −√2, 1)/2 up to its sign. A
 non-converging iteration — which a NaN in the matrix gives — is `Err(Error.NoConvergence(k))`.
 
+The singular values of any matrix come back non-negative and descending, with as much of U and Vᵀ
+as each `SvdJob` asks for — `Omit`, `Thin` (min(m, n) of them) or `Full`:
+
+```sysl
+import sh.sysl.sblas.matrix_mut
+import sh.sysl.slapack.SvdJob
+import sh.sysl.slapack.heap.gesvd_alloc
+
+var a: [6]f64 = [3, 4, 0, 0, 5, 0]                     // [3 0; 4 5; 0 0]
+var s: [2]f64
+var u: [6]f64                                          // the thin U, 3 x 2
+var vt: [4]f64
+print(gesvd_alloc(SvdJob.Thin, SvdJob.Full, matrix_mut(a[..], 3, 2, 3), s[..], matrix_mut(u[..], 3, 2, 3), matrix_mut(vt[..], 2, 2, 2)))  // Ok(())
+print(s)                                               // [6.70820393249937, 2.2360679774997894]
+print(u[0..<3], vt[0], vt[2])                          // [-0.31622776601683794, -0.9486832980505135, 0] -0.7071067811865475 -0.7071067811865475
+
+var r: [6]f64 = [1, 2, 3, 2, 4, 6]                     // [1 2; 2 4; 3 6] has rank one
+var t: [2]f64
+print(gesvd_alloc(SvdJob.Omit, SvdJob.Omit, matrix_mut(r[..], 3, 2, 3), t[..], matrix_mut(r[0..<0], 0, 0, 1), matrix_mut(r[0..<0], 0, 0, 1)), t)
+// Ok(()) [8.366600265340756, 0.0000000000000007320183254117253]
+```
+
+That is 3√5 and √5, the first with U's column (1, 3, 0)/√10 and V's (1, 1)/√2, both up to the sign
+they share; and √70 and a second value at rounding level.
+
 The routines themselves take sblas's `GemmWork` packing buffers, sized by `getrf_work_len`,
 `getrs_work_len`, `potrf_work_len` and `potrs_work_len` — the QR ones a `QrWork`, sized by
-`geqrf_work_len`, `orgqr_work_len` and `ormqr_work_len`, and `syev` a `SyevWork`, sized by
-`syev_work_len` — and allocate nothing; `sh.sysl.slapack.heap`
+`geqrf_work_len`, `orgqr_work_len` and `ormqr_work_len`, `syev` a `SyevWork`, sized by
+`syev_work_len`, and `gesvd` an `SvdWork`, sized by `gesvd_work_len` — and allocate nothing; `sh.sysl.slapack.heap`
 holds the forms that allocate them per call. The design, and what the language made easy or hard, is in [DESIGN.md](DESIGN.md).
 
 ## Tests
@@ -123,6 +148,7 @@ holds the forms that allocate them per call. The design, and what the language m
 `sysl test .` runs the package's tests against the routines' definitions — hand-factored systems, and
 LAPACK's own residual measures on random matrices of every order from 1 to 64 and past the panel width,
 square, tall and wide, symmetric positive definite from either triangle, Q's orthogonality and
-products, and the eigensystems' residuals and orthogonality — and `oracle/` compares the factors with
-the platform's `dgetrf`, `sgetrf`, `dpotrf`, `spotrf`, `dgeqrf` and `sgeqrf` through the `lapack`
-binding, and the eigenvalues and eigenvectors with its `dsyev` and `ssyev`.
+products, the eigensystems' and singular value decompositions' residuals and orthogonality — and
+`oracle/` compares the factors with the platform's `dgetrf`, `sgetrf`, `dpotrf`, `spotrf`, `dgeqrf` and
+`sgeqrf` through the `lapack` binding, the eigenvalues and eigenvectors with its `dsyev` and `ssyev`,
+and the singular values and vectors with its `dgesvd` and `sgesvd`.

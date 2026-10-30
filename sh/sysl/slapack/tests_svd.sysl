@@ -1,0 +1,980 @@
+module sh.sysl.slapack
+@tests
+
+import sh.sysl.sblas.{Real, Matrix, MatrixMut, GemmWork, matrix, matrix_mut}
+import sysl.buf.{Buf, buf_filled}
+import sysl.math.{min, max}
+
+// gesvd, gebrd, orgbr and bdsqr against their definitions: hand-worked 2 x 2s, matrices whose
+// decomposition is known exactly, and random matrices checked by LAPACK's own measures — the residual
+// ‖A − U Σ Vᵀ‖ / (max(m, n) ‖A‖ ε), the loss of orthogonality ‖I − Uᵀ U‖ / (m ε) and ‖I − V Vᵀ‖ /
+// (n ε), and for the reduction ‖A − Q B Pᵀ‖ / (max(m, n) ‖A‖ ε), in the 1-norm and under LAPACK's test
+// threshold of 30. Every workspace is filled with NaN and every matrix sits in padding of NaN, and the
+// reflectors handed to orgbr have NaN everywhere else, so that a read of any of them, or a write past a
+// matrix, shows. The stream and the norms are tests_lu's, the ratios tests_qr's; agreement with the
+// platform's LAPACK is in the oracle's tests.
+
+/** gesvd in a workspace of exactly the length gesvd_work_len gives, every element NaN. */
+private svd[T: Real](jobu: SvdJob, jobvt: SvdJob, a: MatrixMut[T], s: []T, u: MatrixMut[T], vt: MatrixMut[T]) -> Result[unit, Error]
+    val len = gesvd_work_len[T](jobu, jobvt, a.rows, a.cols)
+    val bidiag: Buf[T] = buf_filled(len.bidiag, T.nan())
+    val block: Buf[T] = buf_filled(len.qr.block, T.nan())
+    val pa: Buf[T] = buf_filled(len.qr.gemm.a, T.nan())
+    val pb: Buf[T] = buf_filled(len.qr.gemm.b, T.nan())
+    gesvd(jobu, jobvt, a, s, u, vt, SvdWork(bidiag.view(), QrWork(block.view(), GemmWork(pa.view(), pb.view()))))
+
+/** gebrd in a work vector of exactly the length gebrd_work_len gives, every element NaN. */
+private reduce_bd[T: Real](a: MatrixMut[T], d: []T, e: []T, tauq: []T, taup: []T)
+    val work: Buf[T] = buf_filled(gebrd_work_len[T](a.rows, a.cols), T.nan())
+    gebrd(a, d, e, tauq, taup, work.view())
+
+/** orgbr in a workspace of exactly the length orgbr_work_len gives, every element NaN. */
+private form_br[T: Real](vect: Reflectors, a: MatrixMut[T], k: usize, tau: []const T)
+    val len = orgbr_work_len[T](vect, a.rows, a.cols, k)
+    val block: Buf[T] = buf_filled(len.block, T.nan())
+    val pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
+    val pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
+    orgbr(vect, a, k, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+
+/** An empty matrix, for a job that forms no vectors. */
+private nothing[T: Real](s: []T) -> MatrixMut[T] = matrix_mut(s[0..<0], 0, 0, 1)
+
+/** ‖A − U Σ Vᵀ‖₁ / (max(m, n) ‖A‖₁ ε), over the first min(m, n) columns of `u` and rows of `vt`. */
+private svd_ratio[T: Real](a: Matrix[T], u: Matrix[T], s: []const T, vt: Matrix[T]) -> T
+    val (m, n) = (a.rows, a.cols)
+    val k = min(m, n)
+    val diff = (i: usize, j: usize) ->
+        var x = a.at(i, j)
+        for p in 0..<k
+            x = x - u.at(i, p) * s[p] * vt.at(p, j)
+        x
+    ratio_of(norm1(m, n, diff), T(max1(m, n)) * norm1(m, n, (i, j) -> a.at(i, j)))
+
+/** ‖A − Q B Pᵀ‖₁ / (max(m, n) ‖A‖₁ ε) for gebrd's B, of diagonal `d` and off-diagonal `e` — upper for a
+ * tall A and lower for a wide one — with orgbr's `q`, m x min(m, n), and `pt`, min(m, n) x n.
+ */
+private bidiag_ratio[T: Real](a: Matrix[T], q: Matrix[T], d: []const T, e: []const T, pt: Matrix[T]) -> T
+    val (m, n) = (a.rows, a.cols)
+    val k = min(m, n)
+    val upper = m >= n
+    val diff = (i: usize, j: usize) ->
+        var x = a.at(i, j)
+        for p in 0..<k
+            var t = d[p] * pt.at(p, j)
+            if upper && p + 1 < k then t = t + e[p] * pt.at(p + 1, j)
+            if !upper && p > 0 then t = t + e[p - 1] * pt.at(p - 1, j)
+            x = x - q.at(i, p) * t
+        x
+    ratio_of(norm1(m, n, diff), T(max1(m, n)) * norm1(m, n, (i, j) -> a.at(i, j)))
+
+/** Whether `s[0..<k]` is non-negative and in descending order. */
+private descending[T: Real](s: []const T, k: usize) -> bool
+    for i in 0..<k
+        if !(s[i] >= T.zero()) then return false
+        if i > 0 && !(s[i - 1] >= s[i]) then return false
+    true
+
+/** Whether `x` is zero or in [1, 2], as every reflector's scale must be. */
+private scale_ok[T: Real](x: T) -> bool = x == T.zero() || (x >= T.one() && x <= T(2))
+
+/** Checks gebrd and orgbr on the `m` x `n` matrix in `s` (leading dimension `ld`, the padding NaN): the
+ * reduction's residual, Q's and Pᵀ's orthogonality, B left in A beside the reflectors, every scale zero or
+ * in [1, 2] and the unused one zero, and nothing written past a matrix or a slice.
+ */
+private check_bidiag_of[T: Real](s: []const T, m: usize, n: usize, ld: usize)
+    val a = matrix(s, m, n, ld)
+    val k = min(m, n)
+    val tall = m >= n
+    val at = s"$m x $n"
+    val b = copy_of(s)
+    val d: Buf[T] = buf_filled(k + 1, T.nan())
+    val e: Buf[T] = buf_filled(k, T.nan())
+    val tauq: Buf[T] = buf_filled(k + 1, T.nan())
+    val taup: Buf[T] = buf_filled(k + 1, T.nan())
+    reduce_bd(matrix_mut(b.view(), m, n, ld), d.view()[0..<k], e.view()[0..<k - 1], tauq.view()[0..<k], taup.view()[0..<k])
+    assert(padding_kept(b.view(), m, n, ld), s"gebrd wrote past its matrix at $at")
+    assert(d[k].is_nan() && e[k - 1].is_nan() && tauq[k].is_nan() && taup[k].is_nan(), s"gebrd wrote past a slice at $at")
+    for i in 0..<k
+        assert(scale_ok(tauq[i]) && scale_ok(taup[i]), s"τ $i is ${f64(tauq[i])}, ${f64(taup[i])} at $at")
+        assert(b[i + i * ld] == d[i], s"A does not hold B's diagonal $i at $at")
+        if i + 1 < k
+            val beside = if tall then b[i + (i + 1) * ld] else b[i + 1 + i * ld]
+            assert(beside == e[i], s"A does not hold B's off-diagonal $i at $at")
+    assert((if tall then taup[k - 1] else tauq[k - 1]) == T.zero(), s"the unused scale is not zero at $at")
+    // Q, m x k, from the reflectors alone: below the diagonal (tall) or the subdiagonal (wide).
+    val below: usize = if tall then 1 else 2
+    val q: Buf[T] = buf_filled((m + 1) * k, T.nan())
+    for j in 0..<k
+        for i in min(j + below, m)..<m do q[i + j * (m + 1)] = b[i + j * ld]
+    form_br(Reflectors.Q, matrix_mut(q.view(), m, k, m + 1), n, tauq.view()[0..<k])
+    assert(padding_kept(q.view(), m, k, m + 1), s"orgbr wrote past Q at $at")
+    // Pᵀ, k x n, from the reflectors alone: right of the superdiagonal (tall) or the diagonal (wide).
+    val right: usize = if tall then 2 else 1
+    val ldp = k + 2
+    val pt: Buf[T] = buf_filled(ldp * n, T.nan())
+    for i in 0..<k
+        for j in min(i + right, n)..<n do pt[i + j * ldp] = b[i + j * ld]
+    form_br(Reflectors.P, matrix_mut(pt.view(), k, n, ldp), m, taup.view()[0..<k])
+    assert(padding_kept(pt.view(), k, n, ldp), s"orgbr wrote past Pᵀ at $at")
+    val qm = matrix(q.view(), m, k, m + 1)
+    val pm = matrix(pt.view(), k, n, ldp)
+    val r = bidiag_ratio(a, qm, d.view(), e.view(), pm)
+    assert(r < T(threshold), s"‖A − Q B Pᵀ‖ / (max(m, n) ‖A‖ ε) = ${f64(r)} at $at")
+    val oq = orth_ratio(qm)
+    assert(oq < T(threshold), s"‖I − Qᵀ Q‖ / (m ε) = ${f64(oq)} at $at")
+    val op = orth_ratio(pm.t())
+    assert(op < T(threshold), s"‖I − P Pᵀ‖ / (n ε) = ${f64(op)} at $at")
+
+/** Checks gesvd on the `m` x `n` matrix in `s` (leading dimension `ld`, the padding NaN) with every job:
+ * the whole and the thin vectors by residual and orthogonality, the values non-negative and descending
+ * and the same, bit for bit, from every job, and each set of vectors the same whether or not the other
+ * is formed — with nothing written past a matrix or a slice.
+ */
+private check_svd_of[T: Real](s: []const T, m: usize, n: usize, ld: usize)
+    val a = matrix(s, m, n, ld)
+    val k = min(m, n)
+    val at = s"$m x $n"
+    // The whole of U and Vᵀ.
+    val f = copy_of(s)
+    val (ldu, ldv) = (m + 2, n + 1)
+    val u: Buf[T] = buf_filled(ldu * m, T.nan())
+    val vt: Buf[T] = buf_filled(ldv * n, T.nan())
+    val sv: Buf[T] = buf_filled(k + 1, T.nan())
+    assert(svd(SvdJob.Full, SvdJob.Full, matrix_mut(f.view(), m, n, ld), sv.view(), matrix_mut(u.view(), m, m, ldu), matrix_mut(vt.view(), n, n, ldv)) == Ok(()), s"gesvd failed at $at")
+    assert(padding_kept(f.view(), m, n, ld) && padding_kept(u.view(), m, m, ldu) && padding_kept(vt.view(), n, n, ldv), s"gesvd wrote past a matrix at $at")
+    assert(sv[k].is_nan(), s"gesvd wrote past s[k] at $at")
+    assert(descending(sv.view(), k), s"the singular values are not descending at $at")
+    val um = matrix(u.view(), m, m, ldu)
+    val vm = matrix(vt.view(), n, n, ldv)
+    val r = svd_ratio(a, um, sv.view(), vm)
+    assert(r < T(threshold), s"‖A − U Σ Vᵀ‖ / (max(m, n) ‖A‖ ε) = ${f64(r)} at $at")
+    val ou = orth_ratio(um)
+    assert(ou < T(threshold), s"‖I − Uᵀ U‖ / (m ε) = ${f64(ou)} at $at")
+    val ov = orth_ratio(vm.t())
+    assert(ov < T(threshold), s"‖I − V Vᵀ‖ / (n ε) = ${f64(ov)} at $at")
+    // The thin ones.
+    val g = copy_of(s)
+    val (ldt, ldw) = (m + 1, k + 2)
+    val ut: Buf[T] = buf_filled(ldt * k, T.nan())
+    val vtt: Buf[T] = buf_filled(ldw * n, T.nan())
+    val st: Buf[T] = buf_filled(k + 1, T.nan())
+    assert(svd(SvdJob.Thin, SvdJob.Thin, matrix_mut(g.view(), m, n, ld), st.view(), matrix_mut(ut.view(), m, k, ldt), matrix_mut(vtt.view(), k, n, ldw)) == Ok(()), s"gesvd of the thin vectors failed at $at")
+    assert(padding_kept(ut.view(), m, k, ldt) && padding_kept(vtt.view(), k, n, ldw) && st[k].is_nan(), s"gesvd of the thin vectors wrote past a matrix at $at")
+    val utm = matrix(ut.view(), m, k, ldt)
+    val vtm = matrix(vtt.view(), k, n, ldw)
+    val rt = svd_ratio(a, utm, st.view(), vtm)
+    assert(rt < T(threshold), s"thin ‖A − U Σ Vᵀ‖ / (max(m, n) ‖A‖ ε) = ${f64(rt)} at $at")
+    assert(orth_ratio(utm) < T(threshold) && orth_ratio(vtm.t()) < T(threshold), s"the thin vectors are not orthonormal at $at")
+    // The values alone.
+    val h = copy_of(s)
+    val only: Buf[T] = buf_filled(k + 1, T.nan())
+    assert(svd(SvdJob.Omit, SvdJob.Omit, matrix_mut(h.view(), m, n, ld), only.view(), nothing(only.view()), nothing(only.view())) == Ok(()), s"gesvd of the values failed at $at")
+    assert(padding_kept(h.view(), m, n, ld) && only[k].is_nan(), s"gesvd of the values wrote past a matrix at $at")
+    for i in 0..<k
+        assert(st[i] == sv[i] && only[i] == sv[i], s"singular value $i differs between the jobs at $at")
+    // U alone is the U formed beside Vᵀ, and Vᵀ alone the Vᵀ formed beside U.
+    val x = copy_of(s)
+    val ux: Buf[T] = buf_filled(ldt * k, T.nan())
+    val sx: Buf[T] = buf_filled(k, T.nan())
+    assert(svd(SvdJob.Thin, SvdJob.Omit, matrix_mut(x.view(), m, n, ld), sx.view(), matrix_mut(ux.view(), m, k, ldt), nothing(sx.view())) == Ok(()))
+    for i in 0..<ldt * k
+        assert(ux[i] == ut[i] || (ux[i].is_nan() && ut[i].is_nan()), s"U alone differs from U beside Vᵀ at $at")
+    val y = copy_of(s)
+    val vy: Buf[T] = buf_filled(ldv * n, T.nan())
+    assert(svd(SvdJob.Omit, SvdJob.Full, matrix_mut(y.view(), m, n, ld), sx.view(), nothing(sx.view()), matrix_mut(vy.view(), n, n, ldv)) == Ok(()))
+    for i in 0..<ldv * n
+        assert(vy[i] == vt[i] || (vy[i].is_nan() && vt[i].is_nan()), s"Vᵀ alone differs from Vᵀ beside U at $at")
+    check_bidiag_of(s, m, n, ld)
+
+/** check_svd_of a random `m` x `n` matrix. */
+private check_svd[T: Real](m: usize, n: usize, seed: u64)
+    var g = Stream(seed)
+    val ld = m + 3
+    val s = random[T](&g, m, n, ld, T.nan())
+    check_svd_of(s.view(), m, n, ld)
+
+@test("gesvd, gebrd and orgbr on random square matrices of every order 1 to 64: within LAPACK's threshold, f64")
+svd_random_small_f64()
+    for n in 1..64
+        check_svd[f64](n, n, u64(n))
+
+@test("gesvd, gebrd and orgbr on random square matrices of every order 1 to 64: within LAPACK's threshold, f32")
+svd_random_small_f32()
+    for n in 1..64
+        check_svd[f32](n, n, u64(n))
+
+@test("gesvd, gebrd and orgbr past orgqr's block: orders 65, 100, 128 and 129, f64 and f32")
+svd_random_large()
+    val orders: [4]usize = [65, 100, 128, 129]
+    for n in orders
+        check_svd[f64](n, n, u64(n) * 3)
+        check_svd[f32](n, n, u64(n) * 3)
+
+@test("gesvd, gebrd and orgbr on every shape up to 12 x 12, tall and wide, f64 and f32")
+svd_every_shape()
+    for m in 1..12
+        for n in 1..12
+            check_svd[f64](m, n, u64(m * 13 + n))
+            check_svd[f32](m, n, u64(m * 13 + n))
+
+@test("gesvd, gebrd and orgbr on tall and wide shapes up to 300 x 100, f64 and f32")
+svd_tall_and_wide()
+    val shapes: [8](usize, usize) = [(300, 100), (100, 300), (150, 70), (70, 150), (200, 65), (65, 200), (130, 3), (3, 130)]
+    for (m, n) in shapes
+        check_svd[f64](m, n, u64(m + n))
+        check_svd[f32](m, n, u64(m + n))
+
+// --- Hand-checked ----------------------------------------------------------------------------------
+
+@test("a 2 x 2 worked by hand: [3 0; 4 5] has σ 3√5 and √5, U's columns (1, 3)/√10 and (3, −1)/√10 and V's (1, 1)/√2 and (1, −1)/√2, up to a shared sign")
+svd_by_hand()
+    val r5 = 5.0.sqrt()
+    val r10 = 10.0.sqrt()
+    val r2 = 2.0.sqrt()
+    val want_s: [2]f64 = [3 * r5, r5]
+    val want_u: [4]f64 = [1 / r10, 3 / r10, 3 / r10, -1 / r10]
+    val want_vt: [4]f64 = [1 / r2, 1 / r2, 1 / r2, -1 / r2]
+    for job in [SvdJob.Thin, SvdJob.Full]
+        var a: [4]f64 = [3, 4, 0, 5]
+        var u: [4]f64
+        var vt: [4]f64
+        var s: [2]f64
+        assert(svd(job, job, matrix_mut(a[..], 2, 2, 2), s[..], matrix_mut(u[..], 2, 2, 2), matrix_mut(vt[..], 2, 2, 2)) == Ok(()))
+        val tol = 4 * f64.epsilon()
+        for i in 0..<2
+            assert((s[i] - want_s[i]).abs() <= tol * want_s[0], s"σ $i is ${s[i]}")
+            // U's column i and Vᵀ's row i share a sign.
+            val sign = if u[2 * i] * want_u[2 * i] < 0 then -1.0 else 1.0
+            for r in 0..<2
+                assert((u[r + 2 * i] - sign * want_u[r + 2 * i]).abs() <= tol, s"U($r, $i) is ${u[r + 2 * i]}")
+                assert((vt[i + 2 * r] - sign * want_vt[i + 2 * r]).abs() <= tol, s"Vᵀ($i, $r) is ${vt[i + 2 * r]}")
+
+/** bdsqr of the upper bidiagonal `[f g; 0 h]` from identities: σ against the closed form, and B = U Σ Vᵀ
+ * with U and V orthogonal, all within 4 ε of the larger σ.
+ */
+private check_two_bd(f: f64, g: f64, h: f64)
+    val (fa, ga, ha) = (f.abs(), g.abs(), h.abs())
+    val big = (((fa + ha) * (fa + ha) + ga * ga).sqrt() + ((fa - ha) * (fa - ha) + ga * ga).sqrt()) / 2
+    val small = if big == 0 then 0.0 else fa * ha / big
+    var d: [2]f64 = [f, h]
+    var e: [1]f64 = [g]
+    var u: [4]f64 = [1, 0, 0, 1]
+    var vt: [4]f64 = [1, 0, 0, 1]
+    assert(bdsqr(d[..], e[..], matrix_mut(vt[..], 2, 2, 2), matrix_mut(u[..], 2, 2, 2)) == Ok(()))
+    val tol = 4 * f64.epsilon()
+    val at = s"[$f $g; 0 $h]"
+    // las2, the shift, is the smaller value alone, and is checked here since nothing it answers shows it.
+    val shift = las2(f, g, h)
+    assert((shift - small).abs() <= tol * big, s"las2 is $shift, not $small, for $at")
+    assert((d[0] - big).abs() <= tol * big && (d[1] - small).abs() <= tol * big, s"σ are ${d[0]} and ${d[1]}, not $big and $small, of $at")
+    assert(d[0] >= d[1] && d[1] >= 0, s"σ are not descending and non-negative for $at")
+    val b: [4]f64 = [f, 0, g, h]
+    for j in 0..<2
+        for i in 0..<2
+            val x = u[i] * d[0] * vt[2 * j] + u[i + 2] * d[1] * vt[1 + 2 * j]
+            assert((x - b[i + 2 * j]).abs() <= tol * big, s"(U Σ Vᵀ)($i, $j) is $x for $at")
+            val uu = u[2 * i] * u[2 * j] + u[1 + 2 * i] * u[1 + 2 * j]
+            val vv = vt[i] * vt[j] + vt[i + 2] * vt[j + 2]
+            val id = if i == j then 1.0 else 0.0
+            assert((uu - id).abs() <= tol && (vv - id).abs() <= tol, s"U or V is not orthogonal for $at")
+
+@test("bdsqr on 2 x 2 bidiagonals worked by hand, through every branch of lasv2: f, g or h the largest, g zero, huge or tiny, signs")
+svd_two_by_two()
+    check_two_bd(1, 1, 1)
+    check_two_bd(2, 3, 5)
+    check_two_bd(-2, 3, 5)
+    check_two_bd(5, -3, 2)
+    check_two_bd(-5, 3, -2)
+    check_two_bd(1, 7, 2)
+    check_two_bd(-1, -7, 2)
+    check_two_bd(3, 0, -4)
+    check_two_bd(-4, 0, 3)
+    check_two_bd(1, 1e20, 1)
+    check_two_bd(2, -1e20, -3)
+    check_two_bd(0, 1, 0)
+    check_two_bd(0, 0, 0)
+    check_two_bd(1, 1e-200, 1)
+    check_two_bd(-1, 1e-200, 1)
+    check_two_bd(2, 1e-200, 1)
+    check_two_bd(1, 2, 0)
+    check_two_bd(0, 2, 1)
+    check_two_bd(1e300, 1e300, 1e-300)
+    check_two_bd(1.5, 0.5, 1.5)
+
+/** Checks the `m` x `n` matrix `s` (column-major, leading dimension `m`) has the decomposition given by
+ * exact arithmetic: its values `want`, and U Σ Vᵀ equal to it to the last bit.
+ */
+private check_exact(s: []const f64, m: usize, n: usize, want: []const f64)
+    val k = min(m, n)
+    val f = copy_of(s)
+    val u: Buf[f64] = buf_filled(m * m, f64.nan())
+    val vt: Buf[f64] = buf_filled(n * n, f64.nan())
+    val sv: Buf[f64] = buf_filled(k, f64.nan())
+    assert(svd(SvdJob.Full, SvdJob.Full, matrix_mut(f.view(), m, n, m), sv.view(), matrix_mut(u.view(), m, m, m), matrix_mut(vt.view(), n, n, n)) == Ok(()))
+    for i in 0..<k do assert(sv[i] == want[i], s"σ $i is ${sv[i]}, not ${want[i]}, at $m x $n")
+    for j in 0..<n
+        for i in 0..<m
+            var x: f64 = 0
+            for p in 0..<k do x += u[i + p * m] * sv[p] * vt[p + j * n]
+            assert(x == s[i + j * m], s"(U Σ Vᵀ)($i, $j) is $x, not ${s[i + j * m]}, at $m x $n")
+    assert(orth_ratio(matrix(u.view(), m, m, m)) == 0 && orth_ratio(matrix(vt.view(), n, n, n).t()) == 0, s"U or V is not exactly orthogonal at $m x $n")
+
+@test("a diagonal matrix, square, tall and wide: σ its diagonal's magnitudes sorted, U a permutation and V a signed one, exactly")
+svd_diagonal()
+    val diag: [6]f64 = [3, -7, 0, 7, -0.5, 2]
+    val want: [6]f64 = [7, 7, 3, 2, 0.5, 0]
+    val shapes: [3](usize, usize) = [(6, 6), (9, 6), (6, 9)]
+    for (m, n) in shapes
+        val s: Buf[f64] = buf_filled(m * n, 0)
+        for i in 0..<6 do s[i + i * m] = diag[i]
+        check_exact(s.view(), m, n, want[..])
+
+@test("the zero matrix, square, tall and wide: every σ zero and U and Vᵀ the identity, exactly")
+svd_zero()
+    val shapes: [3](usize, usize) = [(5, 5), (8, 3), (3, 8)]
+    for (m, n) in shapes
+        val k = min(m, n)
+        val a: Buf[f64] = buf_filled(m * n, 0)
+        val u: Buf[f64] = buf_filled(m * m, f64.nan())
+        val vt: Buf[f64] = buf_filled(n * n, f64.nan())
+        val s: Buf[f64] = buf_filled(k, f64.nan())
+        assert(svd(SvdJob.Full, SvdJob.Full, matrix_mut(a.view(), m, n, m), s.view(), matrix_mut(u.view(), m, m, m), matrix_mut(vt.view(), n, n, n)) == Ok(()))
+        for i in 0..<k do assert(s[i] == 0)
+        for j in 0..<m
+            for i in 0..<m do assert(u[i + j * m] == (if i == j then 1.0 else 0.0), s"U is not the identity at $m x $n")
+        for j in 0..<n
+            for i in 0..<n do assert(vt[i + j * n] == (if i == j then 1.0 else 0.0), s"Vᵀ is not the identity at $m x $n")
+
+@test("an already bidiagonal matrix, upper tall and lower wide: gebrd's τ are all zero and B comes back bit for bit, and gesvd is within the threshold")
+svd_bidiagonal()
+    var g = Stream(41)
+    val shapes: [3](usize, usize) = [(9, 6), (6, 9), (7, 7)]
+    for (m, n) in shapes
+        val k = min(m, n)
+        val s: Buf[f64] = buf_filled(m * n, 0)
+        for i in 0..<k
+            s[i + i * m] = g.next[f64]()
+            if i + 1 < k
+                if m >= n then s[i + (i + 1) * m] = g.next[f64]() else s[i + 1 + i * m] = g.next[f64]()
+        val b = copy_of(s.view())
+        val d: Buf[f64] = buf_filled(k, f64.nan())
+        val e: Buf[f64] = buf_filled(k - 1, f64.nan())
+        val tauq: Buf[f64] = buf_filled(k, f64.nan())
+        val taup: Buf[f64] = buf_filled(k, f64.nan())
+        reduce_bd(matrix_mut(b.view(), m, n, m), d.view(), e.view(), tauq.view(), taup.view())
+        for i in 0..<m * n do assert(b[i] == s[i], s"gebrd changed a bidiagonal matrix at $m x $n")
+        for i in 0..<k
+            assert(tauq[i] == 0 && taup[i] == 0, s"τ $i is not zero at $m x $n")
+            assert(d[i] == s[i + i * m])
+            if i + 1 < k then assert(e[i] == (if m >= n then s[i + (i + 1) * m] else s[i + 1 + i * m]))
+        check_svd_of(s.view(), m, n, m)
+
+/** A random orthogonal order-`n` matrix: the Q of a random matrix's QR factorisation. */
+private orthogonal[T: Real](g: *Stream, n: usize) -> Buf[T]
+    val q = random[T](g, n, n, n, T.zero())
+    val tau: Buf[T] = buf_filled(n, T.zero())
+    val len = geqrf_work_len[T](n, n)
+    val block: Buf[T] = buf_filled(len.block, T.zero())
+    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    geqrf(matrix_mut(q.view(), n, n, n), tau.view(), QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    orgqr(matrix_mut(q.view(), n, n, n), tau.view(), QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    q
+
+/** U₀ Σ V₀ᵀ for random orthogonal U₀ and V₀ and the `m` x `n` Σ of `sigma`. */
+private with_values[T: Real](sigma: []const T, m: usize, n: usize, seed: u64) -> Buf[T]
+    var g = Stream(seed)
+    val u = orthogonal[T](&g, m)
+    val v = orthogonal[T](&g, n)
+    val a: Buf[T] = buf_filled(m * n, T.zero())
+    for j in 0..<n
+        for i in 0..<m
+            var x = T.zero()
+            for p in 0..<sigma.len do x = x + u[i + p * m] * sigma[p] * v[j + p * n]
+            a[i + j * m] = x
+    a
+
+/** check_svd_of the matrix with singular values `sigma` (descending), and its σ against them. */
+private check_values[T: Real](sigma: []const T, m: usize, n: usize, seed: u64)
+    val a = with_values(sigma, m, n, seed)
+    check_svd_of(a.view(), m, n, m)
+    val k = min(m, n)
+    val f = copy_of(a.view())
+    val s: Buf[T] = buf_filled(k, T.nan())
+    assert(svd(SvdJob.Omit, SvdJob.Omit, matrix_mut(f.view(), m, n, m), s.view(), nothing(s.view()), nothing(s.view())) == Ok(()))
+    val anorm = T(max1(m, n)) * norm1(m, n, (i, j) -> a[i + j * m])
+    for i in 0..<k
+        val want = if i < sigma.len then sigma[i] else T.zero()
+        val d = ratio_of((s[i] - want).abs(), anorm)
+        assert(d < T(threshold), s"σ $i is off by ${f64(d)} at $m x $n")
+
+@test("repeated singular values: clusters of four, three and two, tall, wide and square, f64 and f32")
+svd_repeated()
+    val sigma: [12]f64 = [3, 3, 3, 3, 2, 2, 2, 1, 1, 0.5, 0.25, 0.25]
+    val narrow: [12]f32 = [3, 3, 3, 3, 2, 2, 2, 1, 1, 0.5, 0.25, 0.25]
+    val shapes: [3](usize, usize) = [(12, 12), (20, 12), (12, 20)]
+    for (m, n) in shapes
+        check_values(sigma[..], m, n, u64(m * n))
+        check_values(narrow[..], m, n, u64(m * n))
+
+@test("rank-deficient products B C: the singular values past the rank vanish to within the threshold")
+svd_rank_deficient()
+    val shapes: [5](usize, usize, usize) = [(40, 30, 10), (30, 40, 10), (50, 50, 1), (20, 20, 19), (25, 7, 3)]
+    for (m, n, r) in shapes
+        var g = Stream(u64(m + n + r))
+        val b = random[f64](&g, m, r, m, 0)
+        val c = random[f64](&g, r, n, r, 0)
+        val a: Buf[f64] = buf_filled(m * n, 0)
+        for j in 0..<n
+            for i in 0..<m
+                for p in 0..<r do a[i + j * m] += b[i + p * m] * c[p + j * r]
+        check_svd_of(a.view(), m, n, m)
+        val f = copy_of(a.view())
+        val s: Buf[f64] = buf_filled(min(m, n), 0)
+        assert(svd(SvdJob.Omit, SvdJob.Omit, matrix_mut(f.view(), m, n, m), s.view(), nothing(s.view()), nothing(s.view())) == Ok(()))
+        val anorm = f64(max1(m, n)) * norm1(m, n, (i, j) -> a[i + j * m])
+        assert(ratio_of(s[r - 1], anorm) > 1e6, s"σ ${r - 1} is ${s[r - 1]}, as small as those past the rank $r")
+        for i in r..<min(m, n)
+            assert(ratio_of(s[i], anorm) < f64(threshold), s"σ $i past the rank is ${s[i]} at $m x $n")
+
+@test("the all-ones matrix: one σ of √(m n) and the rest zero, within the threshold")
+svd_ones()
+    check_values_ones(9, 9)
+    check_values_ones(16, 5)
+    check_values_ones(5, 16)
+
+private check_values_ones(m: usize, n: usize)
+    val a: Buf[f64] = buf_filled(m * n, 1)
+    check_svd_of(a.view(), m, n, m)
+    val s: Buf[f64] = buf_filled(min(m, n), 0)
+    assert(svd(SvdJob.Omit, SvdJob.Omit, matrix_mut(a.view(), m, n, m), s.view(), nothing(s.view()), nothing(s.view())) == Ok(()))
+    val anorm = f64(max1(m, n)) * f64(m)
+    assert(ratio_of((s[0] - f64(m * n).sqrt()).abs(), anorm) < f64(threshold), s"σ 0 is ${s[0]}")
+    for i in 1..<min(m, n) do assert(ratio_of(s[i], anorm) < f64(threshold), s"σ $i is ${s[i]}")
+
+/** A random 30 x 20 matrix and its transpose, times `scale`, against the same unscaled: within the
+ * threshold, and every σ `scale` times the unscaled one's to within it.
+ */
+private check_scaled_svd[T: Real](scale: T, seed: u64)
+    val shapes: [2](usize, usize) = [(30, 20), (20, 30)]
+    for (m, n) in shapes
+        var g = Stream(seed)
+        val a = random[T](&g, m, n, m, T.zero())
+        val big = copy_of(a.view())
+        for i in 0..<m * n do big[i] = big[i] * scale
+        check_svd_of(big.view(), m, n, m)
+        val k = min(m, n)
+        val s: Buf[T] = buf_filled(k, T.nan())
+        val sb: Buf[T] = buf_filled(k, T.nan())
+        val f = copy_of(a.view())
+        assert(svd(SvdJob.Omit, SvdJob.Omit, matrix_mut(f.view(), m, n, m), s.view(), nothing(s.view()), nothing(s.view())) == Ok(()))
+        assert(svd(SvdJob.Omit, SvdJob.Omit, matrix_mut(big.view(), m, n, m), sb.view(), nothing(s.view()), nothing(s.view())) == Ok(()))
+        val anorm = T(max1(m, n)) * norm1(m, n, (i, j) -> a[i + j * m])
+        for i in 0..<k
+            val d = ratio_of((sb[i] / scale - s[i]).abs(), anorm)
+            assert(d < T(threshold), s"σ $i is off by ${f64(d)} at scale ${f64(scale)}")
+
+@test("a matrix too small or too large for the iteration is scaled into range and its singular values scaled back: 2^±900 at f64, 2^±60 at f32")
+svd_extreme_scale()
+    check_scaled_svd[f64](0x1p900, 51)
+    check_scaled_svd[f64](0x1p-900, 52)
+    check_scaled_svd[f32](0x1p60, 53)
+    check_scaled_svd[f32](0x1p-60, 54)
+
+@test("a column whose norm is representable but within √2 of overflow: larfg's α − β would overflow unscaled, and scaled U, σ and Vᵀ are right")
+svd_near_overflow()
+    val big = 0x1p1023
+    val want = big * 2.44.sqrt()
+    for wide in [false, true]
+        var a: [2]f64 = [big, 1.2 * big]
+        var s: [1]f64
+        var u: [4]f64
+        var vt: [4]f64
+        val (m, n): (usize, usize) = if wide then (1, 2) else (2, 1)
+        assert(svd(SvdJob.Full, SvdJob.Full, matrix_mut(a[..], m, n, m), s[..], matrix_mut(u[..], m, m, m), matrix_mut(vt[..], n, n, n)) == Ok(()))
+        assert((s[0] - want).abs() <= 4 * f64.epsilon() * want, s"σ is ${s[0]}, not $want")
+        val q = if wide then matrix(vt[..], n, n, n).t() else matrix(u[..], m, m, m)
+        assert(orth_ratio(q) < f64(threshold), "the vectors are not orthogonal")
+        val orig: [2]f64 = [big, 1.2 * big]
+        for i in 0..<2
+            // Column i of the long side's vectors times σ and the short side's ±1.
+            val short = if wide then u[0] else vt[0]
+            val x = q.at(i, 0) * short * s[0]
+            assert((x - orig[i]).abs() <= 4 * f64.epsilon() * want, s"element $i of U Σ Vᵀ is $x")
+
+@test("a subnormal matrix is scaled up first: its singular values are 2^-1060 times the unscaled ones to the last subnormal bit or two")
+svd_subnormal()
+    val shapes: [2](usize, usize) = [(12, 9), (9, 12)]
+    for (m, n) in shapes
+        var g = Stream(61)
+        // Small integers, so that 2^-1060 times them is exact.
+        val s: Buf[f64] = buf_filled(m * n, 0)
+        for i in 0..<m * n do s[i] = f64(int(g.next[f64]() * 1000))
+        val tiny = copy_of(s.view())
+        for i in 0..<m * n do tiny[i] = tiny[i] * 0x1p-1060
+        val k = min(m, n)
+        for job in [SvdJob.Omit, SvdJob.Full]
+            val w: Buf[f64] = buf_filled(k, 0)
+            val wt: Buf[f64] = buf_filled(k, 0)
+            val u: Buf[f64] = buf_filled(m * m, 0)
+            val vt: Buf[f64] = buf_filled(n * n, 0)
+            val f = copy_of(s.view())
+            val ft = copy_of(tiny.view())
+            val (um, vm) = if job == SvdJob.Full then (matrix_mut(u.view(), m, m, m), matrix_mut(vt.view(), n, n, n)) else (nothing(u.view()), nothing(vt.view()))
+            assert(svd(job, job, matrix_mut(f.view(), m, n, m), w.view(), um, vm) == Ok(()))
+            assert(svd(job, job, matrix_mut(ft.view(), m, n, m), wt.view(), um, vm) == Ok(()))
+            for i in 0..<k
+                val d = (wt[i] - w[i] * 0x1p-1060).abs()
+                assert(d <= 2 * 0x1p-1074, s"σ $i is ${d / 0x1p-1074} subnormal units off at $m x $n")
+            if job == SvdJob.Full
+                assert(orth_ratio(um.as_view()) < f64(threshold) && orth_ratio(vm.as_view().t()) < f64(threshold))
+
+/** σ of the order-`n` upper bidiagonal `d`, `e` by bdsqr with no vectors, and of its mirror — the same
+ * values, B reversed and transposed — which the iteration chases from the other end.
+ */
+private check_graded[T: Real](d: []const T, e: []const T)
+    val n = d.len
+    val (d1, e1) = (copy_of(d), copy_of(e))
+    val d2: Buf[T] = buf_filled(n, T.zero())
+    val e2: Buf[T] = buf_filled(n - 1, T.zero())
+    for i in 0..<n do d2[i] = d[n - 1 - i]
+    for i in 0..<n - 1 do e2[i] = e[n - 2 - i]
+    val none: Buf[T] = buf_filled(0, T.zero())
+    assert(bdsqr(d1.view(), e1.view(), matrix_mut(none.view(), n, 0, n), matrix_mut(none.view(), 0, n, 1)) == Ok(()))
+    assert(bdsqr(d2.view(), e2.view(), matrix_mut(none.view(), n, 0, n), matrix_mut(none.view(), 0, n, 1)) == Ok(()))
+    for i in 0..<n
+        // Relative to σ itself: the zero shift keeps even the smallest to full relative accuracy.
+        val r = (d1[i] - d2[i]).abs() / (d1[i] * T(n) * T.epsilon())
+        assert(r < T(threshold), s"σ $i = ${f64(d1[i])} differs between the two ends by ${f64(r)} n ε of itself")
+    check_bd_vectors(d, e, d1.view())
+    val (d4, e4) = (copy_of(d2.view()), copy_of(e2.view()))
+    for i in 0..<n do d4[i] = d[n - 1 - i]
+    for i in 0..<n - 1 do e4[i] = e[n - 2 - i]
+    check_bd_vectors(d4.view(), e4.view(), d2.view())
+
+/** bdsqr of the bidiagonal `d`, `e` from identities: B = U Σ Vᵀ within the threshold, U and V orthogonal,
+ * and the values `values` that bdsqr gave without vectors, bit for bit.
+ */
+private check_bd_vectors[T: Real](d: []const T, e: []const T, values: []const T)
+    val n = d.len
+    if n == 0 then return
+    val u: Buf[T] = buf_filled(n * n, T.zero())
+    val vt: Buf[T] = buf_filled(n * n, T.zero())
+    for i in 0..<n
+        u[i + i * n] = T.one()
+        vt[i + i * n] = T.one()
+    val (d3, e3) = (copy_of(d), copy_of(e))
+    assert(bdsqr(d3.view(), e3.view(), matrix_mut(vt.view(), n, n, n), matrix_mut(u.view(), n, n, n)) == Ok(()))
+    for i in 0..<n do assert(d3[i] == values[i], "the values differ with and without the vectors")
+    val b: Buf[T] = buf_filled(n * n, T.zero())
+    for i in 0..<n
+        b[i + i * n] = d[i]
+        if i + 1 < n then b[i + (i + 1) * n] = e[i]
+    val r = svd_ratio(matrix(b.view(), n, n, n), matrix(u.view(), n, n, n), d3.view(), matrix(vt.view(), n, n, n))
+    assert(r < T(threshold), s"‖B − U Σ Vᵀ‖ / (n ‖B‖ ε) = ${f64(r)}")
+    assert(orth_ratio(matrix(u.view(), n, n, n)) < T(threshold) && orth_ratio(matrix(vt.view(), n, n, n).t()) < T(threshold))
+
+/** A graded bidiagonal of order `n`, each element `ratio` times the one before, from either end. */
+private check_grading[T: Real](n: usize, ratio: T)
+    val d: Buf[T] = buf_filled(n, T.zero())
+    val e: Buf[T] = buf_filled(n - 1, T.zero())
+    var x = T.one()
+    for i in 0..<n
+        d[i] = x * (T.one() + T(i % 3) / T(4))
+        if i + 1 < n then e[i] = x * ratio.sqrt()
+        x = x * ratio
+    check_graded(d.view(), e.view())
+
+/** The f32 σ of a graded or random bidiagonal against the f64 σ of the same elements, each relative to
+ * itself: the f64 answer is exact to f32's precision, so this is an absolute check of relative accuracy.
+ */
+private check_against_f64(d: []const f32, e: []const f32)
+    val n = d.len
+    val (d1, e1) = (copy_of(d), copy_of(e))
+    val d2: Buf[f64] = buf_filled(n, 0)
+    val e2: Buf[f64] = buf_filled(n - 1, 0)
+    for i in 0..<n do d2[i] = f64(d[i])
+    for i in 0..<n - 1 do e2[i] = f64(e[i])
+    var none: [1]f32
+    var wide: [1]f64
+    assert(bdsqr(d1.view(), e1.view(), matrix_mut(none[0..<0], n, 0, n), matrix_mut(none[0..<0], 0, n, 1)) == Ok(()))
+    assert(bdsqr(d2.view(), e2.view(), matrix_mut(wide[0..<0], n, 0, n), matrix_mut(wide[0..<0], 0, n, 1)) == Ok(()))
+    for i in 0..<n
+        val r = (f64(d1[i]) - d2[i]).abs() / (d2[i] * f64(n) * f64(f32.epsilon()))
+        assert(r < f64(threshold), s"σ $i = ${d2[i]} is off by ${r} n ε of itself at f32")
+
+@test("f32 bidiagonals, graded either way and random, against the same in f64: every σ to relative accuracy")
+svd_relative_accuracy()
+    for ratio in [0.125, 0.5, 2.0, 8.0]
+        val n: usize = 10
+        val d: Buf[f32] = buf_filled(n, 0)
+        val e: Buf[f32] = buf_filled(n - 1, 0)
+        var x: f32 = 1
+        for i in 0..<n
+            d[i] = x * (1 + f32(i % 3) / 4)
+            if i + 1 < n then e[i] = x * (if i % 2 == 0 then 0.75 else -0.5)
+            x = x * f32(ratio)
+        check_against_f64(d.view(), e.view())
+    // A tiny σ hidden mid-block behind large ends: the ends' shift is not negligible, and only the
+    // estimate of the block's smallest σ keeps the iteration to the zero shift that resolves it.
+    for tiny in [0x1p-20, 0x1p-30, 0x1p-40]
+        var d: [7]f32 = [1, 0.75, 0.875, f32(tiny), 0.625, 1, 0.5]
+        var e: [6]f32 = [0.5, -0.25, 0.375, 0.25, -0.5, 0.75]
+        check_against_f64(d[..], e[..])
+    var g = Stream(73)
+    for _ in 0..<20
+        val n: usize = 16
+        val d: Buf[f32] = buf_filled(n, 0)
+        val e: Buf[f32] = buf_filled(n - 1, 0)
+        for i in 0..<n do d[i] = g.next[f32]()
+        for i in 0..<n - 1 do e[i] = g.next[f32]()
+        check_against_f64(d.view(), e.view())
+
+@test("graded bidiagonals, from either end: bdsqr's zero shift keeps every σ to relative accuracy, and its vectors are within the threshold")
+svd_graded()
+    check_grading[f64](20, 0x1p-4)
+    check_grading[f64](12, 0x1p-9)
+    check_grading[f32](12, 0x1p-3)
+    check_grading[f32](8, 0x1p-5)
+    // A random bidiagonal, which takes the shifted sweeps.
+    var g = Stream(71)
+    val d: Buf[f64] = buf_filled(30, 0)
+    val e: Buf[f64] = buf_filled(29, 0)
+    for i in 0..<30 do d[i] = g.next[f64]()
+    for i in 0..<29 do e[i] = g.next[f64]()
+    check_graded(d.view(), e.view())
+
+private unconverged_of(r: Result[unit, Error]) -> usize = r match
+    Err(NoConvergence(k)) -> k
+    _ -> 0
+
+@test("a NaN in the matrix answers NoConvergence from every job, tall, wide and square, and in bdsqr")
+svd_nan()
+    val shapes: [3](usize, usize) = [(10, 7), (7, 10), (8, 8)]
+    for (m, n) in shapes
+        var g = Stream(81)
+        val a = random[f64](&g, m, n, m, 0)
+        a[3 + 2 * m] = f64.nan()
+        for job in [SvdJob.Omit, SvdJob.Thin, SvdJob.Full]
+            val k = min(m, n)
+            val f = copy_of(a.view())
+            val (ur, uc) = if job == SvdJob.Full then (m, m) else (m, k)
+            val (vr, vc) = if job == SvdJob.Full then (n, n) else (k, n)
+            val u: Buf[f64] = buf_filled(m * m, 0)
+            val vt: Buf[f64] = buf_filled(n * n, 0)
+            val s: Buf[f64] = buf_filled(k, 0)
+            val um = if job == SvdJob.Omit then nothing(u.view()) else matrix_mut(u.view(), ur, uc, ur)
+            val vm = if job == SvdJob.Omit then nothing(vt.view()) else matrix_mut(vt.view(), vr, vc, vr)
+            assert(unconverged_of(svd(job, job, matrix_mut(f.view(), m, n, m), s.view(), um, vm)) > 0, s"gesvd converged on a NaN at $m x $n")
+    var d: [5]f64 = [1, 2, f64.nan(), 4, 5]
+    var e: [4]f64 = [1, 1, 1, 1]
+    var none: [1]f64
+    assert(unconverged_of(bdsqr(d[..], e[..], matrix_mut(none[0..<0], 5, 0, 5), matrix_mut(none[0..<0], 0, 5, 1))) > 0)
+
+@test("empty input: gesvd, gebrd, orgbr and bdsqr do nothing and need no workspace, but a whole U or Vᵀ of no singular values is the identity")
+svd_empty()
+    val shapes: [3](usize, usize) = [(0, 0), (4, 0), (0, 4)]
+    for (m, n) in shapes
+        for job in [SvdJob.Omit, SvdJob.Thin, SvdJob.Full]
+            val len = gesvd_work_len[f64](job, job, m, n)
+            assert(len.bidiag == 0 && len.qr.block == 0 && len.qr.gemm.a == 0 && len.qr.gemm.b == 0)
+            var a: [1]f64 = [9]
+            var s: [1]f64 = [9]
+            val u: Buf[f64] = buf_filled(m * m + 1, f64.nan())
+            val vt: Buf[f64] = buf_filled(n * n + 1, f64.nan())
+            val um = if job == SvdJob.Full then matrix_mut(u.view(), m, m, max1(m, m)) else if job == SvdJob.Thin then matrix_mut(u.view(), m, 0, max1(m, m)) else nothing(u.view())
+            val vm = if job == SvdJob.Full then matrix_mut(vt.view(), n, n, max1(n, n)) else if job == SvdJob.Thin then matrix_mut(vt.view(), 0, n, 1) else nothing(vt.view())
+            assert(gesvd(job, job, matrix_mut(a[0..<0], m, n, max1(m, m)), s[0..<0], um, vm, SvdWork(a[0..<0], QrWork(a[0..<0], work0()))) == Ok(()))
+            assert(a[0] == 9 && s[0] == 9)
+            assert(u[m * m].is_nan() && vt[n * n].is_nan())
+            val whole = job == SvdJob.Full
+            for j in 0..<m
+                for i in 0..<m
+                    val x = u[i + j * m]
+                    assert(if whole then x == (if i == j then 1.0 else 0.0) else x.is_nan(), s"U is not the identity at $m x $n")
+            for j in 0..<n
+                for i in 0..<n
+                    val x = vt[i + j * n]
+                    assert(if whole then x == (if i == j then 1.0 else 0.0) else x.is_nan(), s"Vᵀ is not the identity at $m x $n")
+    var x: [1]f64 = [9]
+    assert(gebrd_work_len[f64](0, 5) == 0 && gebrd_work_len[f64](5, 0) == 0)
+    gebrd(matrix_mut(x[0..<0], 3, 0, 3), x[0..<0], x[0..<0], x[0..<0], x[0..<0], x[0..<0])
+    gebrd(matrix_mut(x[0..<0], 0, 3, 1), x[0..<0], x[0..<0], x[0..<0], x[0..<0], x[0..<0])
+    orgbr(Reflectors.Q, nothing(x[..]), 0, x[0..<0], QrWork(x[0..<0], work0()))
+    orgbr(Reflectors.P, nothing(x[..]), 0, x[0..<0], QrWork(x[0..<0], work0()))
+    assert(bdsqr(x[0..<0], x[0..<0], nothing(x[..]), nothing(x[..])) == Ok(()))
+    assert(x[0] == 9)
+
+@test("order one: σ is the element's magnitude, and its sign goes to Vᵀ")
+svd_order_one()
+    for x in [-2.5, 0.0, 3.0]
+        var a: [1]f64 = [x]
+        var s: [1]f64
+        var u: [1]f64
+        var vt: [1]f64
+        assert(svd(SvdJob.Full, SvdJob.Full, matrix_mut(a[..], 1, 1, 1), s[..], matrix_mut(u[..], 1, 1, 1), matrix_mut(vt[..], 1, 1, 1)) == Ok(()))
+        assert(s[0] == x.abs() && u[0] * s[0] * vt[0] == x && u[0].abs() == 1 && vt[0].abs() == 1)
+
+@test("the workspace: 3 min(m, n) − 1 + max(m, n), and orgbr's for the vectors asked for, a wide A's the same as its transpose's")
+svd_work_len()
+    val values = gesvd_work_len[f64](SvdJob.Omit, SvdJob.Omit, 100, 40)
+    assert(values.bidiag == 3 * 40 - 1 + 100 && values.qr.block == 0 && values.qr.gemm.a == 0 && values.qr.gemm.b == 0)
+    val full = gesvd_work_len[f64](SvdJob.Full, SvdJob.Full, 100, 40)
+    val q = orgqr_work_len[f64](100, 100, 40)
+    val p = orgtr_work_len[f64](40)
+    assert(full.bidiag == values.bidiag)
+    assert(full.qr.block == max(q.block, p.block) && full.qr.gemm.a == max(q.gemm.a, p.gemm.a) && full.qr.gemm.b == max(q.gemm.b, p.gemm.b))
+    val thin = gesvd_work_len[f64](SvdJob.Thin, SvdJob.Omit, 100, 40)
+    val qt = orgqr_work_len[f64](100, 40, 40)
+    assert(thin.qr.block == qt.block && thin.qr.gemm.a == qt.gemm.a && thin.qr.gemm.b == qt.gemm.b)
+    val vonly = gesvd_work_len[f64](SvdJob.Omit, SvdJob.Thin, 100, 40)
+    assert(vonly.qr.block == p.block && vonly.qr.gemm.a == p.gemm.a && vonly.qr.gemm.b == p.gemm.b)
+    val wide = gesvd_work_len[f64](SvdJob.Omit, SvdJob.Full, 40, 100)
+    assert(wide.bidiag == full.bidiag)
+    val tall_u = gesvd_work_len[f64](SvdJob.Full, SvdJob.Omit, 100, 40)
+    assert(wide.qr.block == tall_u.qr.block && wide.qr.gemm.a == tall_u.qr.gemm.a && wide.qr.gemm.b == tall_u.qr.gemm.b)
+    assert(gebrd_work_len[f64](7, 3) == 7 && gebrd_work_len[f64](3, 7) == 7)
+
+@test("gesvd of a block of a larger matrix, into blocks of larger U and Vᵀ, agrees bit for bit with the same matrix on its own, and touches nothing around them")
+svd_block_view()
+    val m: usize = 70
+    val n: usize = 50
+    var g = Stream(91)
+    val alone = random[f64](&g, m, n, m, 0)
+    val ld: usize = 90
+    val big: Buf[f64] = buf_filled(ld * (n + 4), f64.nan())
+    for j in 0..<n
+        for i in 0..<m do big[(i + 11) + (j + 4) * ld] = alone[i + j * m]
+    val bu: Buf[f64] = buf_filled(ld * (m + 3), f64.nan())
+    val bv: Buf[f64] = buf_filled(ld * (n + 5), f64.nan())
+    val a = copy_of(alone.view())
+    val u: Buf[f64] = buf_filled(m * m, 0)
+    val vt: Buf[f64] = buf_filled(n * n, 0)
+    val s1: Buf[f64] = buf_filled(n, 0)
+    val s2: Buf[f64] = buf_filled(n, 0)
+    assert(svd(SvdJob.Full, SvdJob.Full, matrix_mut(a.view(), m, n, m), s1.view(), matrix_mut(u.view(), m, m, m), matrix_mut(vt.view(), n, n, n)) == Ok(()))
+    val av = matrix_mut(big.view(), ld, n + 4, ld).block(11, 4, m, n)
+    val uv = matrix_mut(bu.view(), ld, m + 3, ld).block(5, 2, m, m)
+    val vv = matrix_mut(bv.view(), ld, n + 5, ld).block(7, 3, n, n)
+    assert(svd(SvdJob.Full, SvdJob.Full, av, s2.view(), uv, vv) == Ok(()))
+    for i in 0..<n do assert(s1[i] == s2[i])
+    for j in 0..<m
+        for i in 0..<m do assert(u[i + j * m] == bu[(i + 5) + (j + 2) * ld])
+    for j in 0..<n
+        for i in 0..<n do assert(vt[i + j * n] == bv[(i + 7) + (j + 3) * ld])
+    for j in 0..<n + 4
+        for i in 0..<ld
+            if !(i >= 11 && i < 11 + m && j >= 4 && j < 4 + n) then assert(big[i + j * ld].is_nan(), "gesvd wrote outside A's block")
+    for j in 0..<m + 3
+        for i in 0..<ld
+            if !(i >= 5 && i < 5 + m && j >= 2 && j < 2 + m) then assert(bu[i + j * ld].is_nan(), "gesvd wrote outside U's block")
+    for j in 0..<n + 5
+        for i in 0..<ld
+            if !(i >= 7 && i < 7 + n && j >= 3 && j < 3 + n) then assert(bv[i + j * ld].is_nan(), "gesvd wrote outside Vᵀ's block")
+
+@test("gesvd on row-major views, the transposes of column-major storage, is within the threshold and agrees with the column-major one")
+svd_row_major_view()
+    val shapes: [2](usize, usize) = [(60, 40), (40, 60)]
+    for (m, n) in shapes
+        var g = Stream(97)
+        // A is m x n, stored row-major: the column-major n x m storage of Aᵀ.
+        val st = random[f64](&g, n, m, n, 0)
+        val a: Buf[f64] = buf_filled(m * n, 0)
+        for j in 0..<n
+            for i in 0..<m do a[i + j * m] = st[j + i * n]
+        val k = min(m, n)
+        val c = copy_of(a.view())
+        val r = copy_of(st.view())
+        val s1: Buf[f64] = buf_filled(k, 0)
+        val s2: Buf[f64] = buf_filled(k, 0)
+        val u: Buf[f64] = buf_filled(m * k, 0)
+        val vt: Buf[f64] = buf_filled(k * n, 0)
+        assert(svd(SvdJob.Omit, SvdJob.Omit, matrix_mut(c.view(), m, n, m), s1.view(), nothing(c.view()), nothing(c.view())) == Ok(()))
+        // U and Vᵀ row-major too.
+        val uv = matrix_mut(u.view(), k, m, k).t()
+        val vv = matrix_mut(vt.view(), n, k, n).t()
+        assert(svd(SvdJob.Thin, SvdJob.Thin, matrix_mut(r.view(), n, m, n).t(), s2.view(), uv, vv) == Ok(()))
+        val am = matrix(a.view(), m, n, m)
+        val ratio = svd_ratio(am, uv.as_view(), s2.view(), vv.as_view())
+        assert(ratio < f64(threshold), s"‖A − U Σ Vᵀ‖ / (max(m, n) ‖A‖ ε) = $ratio on the row-major view")
+        assert(orth_ratio(uv.as_view()) < f64(threshold) && orth_ratio(vv.as_view().t()) < f64(threshold))
+        val norm = f64(max1(m, n)) * norm1(m, n, (i, j) -> a[i + j * m])
+        for i in 0..<k do assert(ratio_of((s1[i] - s2[i]).abs(), norm) < f64(threshold))
+
+// --- Wrong calls -----------------------------------------------------------------------------------
+
+/** An SvdWork of NaN in every buffer, as long as an `m` x `n` gesvd with every vector needs. */
+private enough_svd(m: usize, n: usize) -> (Buf[f64], Buf[f64], Buf[f64], Buf[f64])
+    val len = gesvd_work_len[f64](SvdJob.Full, SvdJob.Full, m, n)
+    (buf_filled(len.bidiag, f64.nan()), buf_filled(len.qr.block, f64.nan()), buf_filled(len.qr.gemm.a, f64.nan()), buf_filled(len.qr.gemm.b, f64.nan()))
+
+/** gesvd of a 4 x 3 with every vector, `u` and `vt` of the shapes given, `s` of `slen`. */
+private call_svd(jobu: SvdJob, jobvt: SvdJob, slen: usize, ur: usize, uc: usize, vr: usize, vc: usize)
+    var a: [12]f64 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 4]
+    val s: Buf[f64] = buf_filled(slen, 0)
+    val u: Buf[f64] = buf_filled(ur * uc, 0)
+    val vt: Buf[f64] = buf_filled(vr * vc, 0)
+    val (t, b, pa, pb) = enough_svd(4, 3)
+    _ = gesvd(jobu, jobvt, matrix_mut(a[..], 4, 3, 4), s.view(), matrix_mut(u.view(), ur, uc, max1(ur, ur)), matrix_mut(vt.view(), vr, vc, max1(vr, vr)), SvdWork(t.view(), QrWork(b.view(), GemmWork(pa.view(), pb.view()))))
+
+@test("the shapes gesvd accepts: U m x min(m, n) or m x m, Vᵀ min(m, n) x n or n x n, and anything at all for an omitted one")
+svd_shapes_accepted()
+    call_svd(SvdJob.Thin, SvdJob.Thin, 3, 4, 3, 3, 3)
+    call_svd(SvdJob.Full, SvdJob.Full, 3, 4, 4, 3, 3)
+    call_svd(SvdJob.Omit, SvdJob.Omit, 3, 2, 5, 1, 1)
+
+@test("gesvd traps on an s shorter than min(m, n)", should_trap)
+svd_short_s()
+    call_svd(SvdJob.Omit, SvdJob.Omit, 2, 0, 0, 0, 0)
+
+@test("gesvd traps on a thin U that is m x m", should_trap)
+svd_thin_u_square()
+    call_svd(SvdJob.Thin, SvdJob.Omit, 3, 4, 4, 0, 0)
+
+@test("gesvd traps on a whole U that is m x min(m, n)", should_trap)
+svd_full_u_thin()
+    call_svd(SvdJob.Full, SvdJob.Omit, 3, 4, 3, 0, 0)
+
+@test("gesvd traps on a U whose rows are not A's", should_trap)
+svd_u_rows()
+    call_svd(SvdJob.Thin, SvdJob.Omit, 3, 3, 3, 0, 0)
+
+@test("gesvd traps on a thin Vᵀ with too many rows", should_trap)
+svd_thin_vt_rows()
+    call_svd(SvdJob.Omit, SvdJob.Thin, 3, 0, 0, 4, 3)
+
+@test("gesvd traps on a Vᵀ whose columns are not A's", should_trap)
+svd_vt_cols()
+    call_svd(SvdJob.Omit, SvdJob.Full, 3, 0, 0, 3, 4)
+
+@test("gesvd traps on a wide A's whole Vᵀ that is min(m, n) x n", should_trap)
+svd_wide_full_vt()
+    var a: [12]f64 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 4]
+    var s: [3]f64
+    var vt: [12]f64
+    val (t, b, pa, pb) = enough_svd(3, 4)
+    _ = gesvd(SvdJob.Omit, SvdJob.Full, matrix_mut(a[..], 3, 4, 3), s[..], nothing(s[..]), matrix_mut(vt[..], 3, 4, 3), SvdWork(t.view(), QrWork(b.view(), GemmWork(pa.view(), pb.view()))))
+
+@test("gesvd traps on a bidiag workspace shorter than gesvd_work_len says", should_trap)
+svd_short_bidiag()
+    var a: [12]f64 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 4]
+    var s: [3]f64
+    var t: [11]f64
+    _ = gesvd(SvdJob.Omit, SvdJob.Omit, matrix_mut(a[..], 4, 3, 4), s[..], nothing(s[..]), nothing(s[..]), SvdWork(t[..], QrWork(t[0..<0], work0())))
+
+@test("gesvd traps on a qr workspace shorter than gesvd_work_len says, for the vectors", should_trap)
+svd_short_qr()
+    var a: [12]f64 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 4]
+    var s: [3]f64
+    var u: [12]f64
+    var t: [12]f64
+    _ = gesvd(SvdJob.Thin, SvdJob.Omit, matrix_mut(a[..], 4, 3, 4), s[..], matrix_mut(u[..], 4, 3, 4), nothing(s[..]), SvdWork(t[..], QrWork(t[0..<2], work0())))
+
+@test("gesvd traps on gemm buffers shorter than gesvd_work_len says, past orgqr's block", should_trap)
+svd_short_gemm()
+    val n: usize = 40
+    var g = Stream(3)
+    val a = random[f64](&g, n, n, n, 0)
+    val u: Buf[f64] = buf_filled(n * n, 0)
+    val s: Buf[f64] = buf_filled(n, 0)
+    val (t, b, pa, pb) = enough_svd(n, n)
+    _ = gesvd(SvdJob.Full, SvdJob.Omit, matrix_mut(a.view(), n, n, n), s.view(), matrix_mut(u.view(), n, n, n), nothing(s.view()), SvdWork(t.view(), QrWork(b.view(), GemmWork(pa.view()[0..<pa.len() - 1], pb.view()))))
+
+/** gebrd of a 4 x 3 with slices of the lengths given. */
+private call_gebrd(dl: usize, el: usize, ql: usize, pl: usize, wl: usize)
+    var a: [12]f64 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 4]
+    val d: Buf[f64] = buf_filled(dl, 0)
+    val e: Buf[f64] = buf_filled(el, 0)
+    val tq: Buf[f64] = buf_filled(ql, 0)
+    val tp: Buf[f64] = buf_filled(pl, 0)
+    val w: Buf[f64] = buf_filled(wl, 0)
+    gebrd(matrix_mut(a[..], 4, 3, 4), d.view(), e.view(), tq.view(), tp.view(), w.view())
+
+@test("gebrd accepts slices of exactly the lengths it needs")
+svd_gebrd_exact()
+    call_gebrd(3, 2, 3, 3, 4)
+
+@test("gebrd traps on a d shorter than min(m, n)", should_trap)
+svd_gebrd_short_d()
+    call_gebrd(2, 2, 3, 3, 4)
+
+@test("gebrd traps on an e shorter than min(m, n) less one", should_trap)
+svd_gebrd_short_e()
+    call_gebrd(3, 1, 3, 3, 4)
+
+@test("gebrd traps on a tauq shorter than min(m, n)", should_trap)
+svd_gebrd_short_tauq()
+    call_gebrd(3, 2, 2, 3, 4)
+
+@test("gebrd traps on a taup shorter than min(m, n)", should_trap)
+svd_gebrd_short_taup()
+    call_gebrd(3, 2, 3, 2, 4)
+
+@test("gebrd traps on a work vector shorter than gebrd_work_len says", should_trap)
+svd_gebrd_short_work()
+    call_gebrd(3, 2, 3, 3, 3)
+
+/** orgbr of an `m` x `n` from `k`, with `tl` scales, in a workspace as long as `orgbr_work_len` says less `short`. */
+private call_orgbr(vect: Reflectors, m: usize, n: usize, k: usize, tl: usize, short: usize)
+    val a: Buf[f64] = buf_filled(m * n, 0)
+    val tau: Buf[f64] = buf_filled(tl, 0)
+    val len = orgbr_work_len[f64](vect, m, n, k)
+    val block: Buf[f64] = buf_filled(len.block - short, 0)
+    orgbr(vect, matrix_mut(a.view(), m, n, max1(m, m)), k, tau.view(), QrWork(block.view(), work0()))
+
+@test("orgbr accepts every shape LAPACK's does: Q tall and thin, whole, and square from a wide reduction; Pᵀ wide and thin, whole, and square from a tall one")
+svd_orgbr_shapes()
+    call_orgbr(Reflectors.Q, 6, 4, 4, 4, 0)
+    call_orgbr(Reflectors.Q, 6, 6, 4, 4, 0)
+    call_orgbr(Reflectors.Q, 4, 4, 6, 4, 0)
+    call_orgbr(Reflectors.P, 4, 6, 4, 4, 0)
+    call_orgbr(Reflectors.P, 6, 6, 4, 4, 0)
+    call_orgbr(Reflectors.P, 4, 4, 6, 4, 0)
+
+@test("orgbr traps on a Q with more columns than rows", should_trap)
+svd_orgbr_q_wide()
+    call_orgbr(Reflectors.Q, 4, 6, 4, 4, 0)
+
+@test("orgbr traps on a Q from a wide reduction that is not square", should_trap)
+svd_orgbr_q_not_square()
+    call_orgbr(Reflectors.Q, 4, 3, 6, 4, 0)
+
+@test("orgbr traps on a Q's tau shorter than min(m, k)", should_trap)
+svd_orgbr_q_short_tau()
+    call_orgbr(Reflectors.Q, 6, 4, 4, 3, 0)
+
+@test("orgbr traps on a Pᵀ with more rows than columns", should_trap)
+svd_orgbr_p_tall()
+    call_orgbr(Reflectors.P, 6, 4, 2, 4, 0)
+
+@test("orgbr traps on a Pᵀ from a tall reduction that is not square", should_trap)
+svd_orgbr_p_not_square()
+    call_orgbr(Reflectors.P, 3, 4, 6, 4, 0)
+
+@test("orgbr traps on a Pᵀ's tau shorter than min(n, k)", should_trap)
+svd_orgbr_p_short_tau()
+    call_orgbr(Reflectors.P, 4, 6, 4, 3, 0)
+
+@test("orgbr traps on a workspace shorter than orgbr_work_len says", should_trap)
+svd_orgbr_short_work()
+    call_orgbr(Reflectors.P, 6, 6, 4, 4, 1)
+
+@test("bdsqr traps on an e shorter than B's order less one", should_trap)
+svd_bdsqr_short_e()
+    var d: [3]f64 = [1, 2, 3]
+    var e: [1]f64 = [1]
+    _ = bdsqr(d[..], e[..], matrix_mut(d[0..<0], 3, 0, 3), matrix_mut(d[0..<0], 0, 3, 1))
+
+@test("bdsqr traps on a Vᵀ whose rows are not B's order", should_trap)
+svd_bdsqr_vt_rows()
+    var d: [3]f64 = [1, 2, 3]
+    var e: [2]f64 = [1, 1]
+    var v: [6]f64
+    _ = bdsqr(d[..], e[..], matrix_mut(v[..], 2, 3, 2), matrix_mut(d[0..<0], 0, 3, 1))
+
+@test("bdsqr traps on a U whose columns are not B's order", should_trap)
+svd_bdsqr_u_cols()
+    var d: [3]f64 = [1, 2, 3]
+    var e: [2]f64 = [1, 1]
+    var v: [6]f64
+    _ = bdsqr(d[..], e[..], matrix_mut(d[0..<0], 3, 0, 3), matrix_mut(v[..], 3, 2, 3))

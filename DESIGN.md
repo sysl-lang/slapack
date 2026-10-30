@@ -15,7 +15,7 @@ float edge cases — and a gap it finds is a gap to fix in sysl.
 | Cholesky | `potrf` (blocked), `potf2` (its unblocked kernel), `potrs` | done, f32 and f64 |
 | QR | `geqrf` (blocked), `geqr2` (its unblocked panel), `orgqr`, `org2r`, `ormqr`, `larfg` | done, f32 and f64 |
 | symmetric eigenproblem | `syev`, `sytrd` (unblocked), `orgtr`, `steqr`, `sterf` | done, f32 and f64 |
-| singular value decomposition | `gesvd` (`gebrd`, `orgbr`, `bdsqr`) | planned |
+| singular value decomposition | `gesvd`, `gebrd` (unblocked), `orgbr`, `bdsqr` | done, f32 and f64 |
 
 Complex element types, the banded and packed storage forms, and the expert drivers (`gesvx` and its
 kind) are not scheduled.
@@ -51,6 +51,11 @@ sytrd(uplo, a, d, e, tau, work)            // Qᵀ A Q = T: d and e its diagonal
 orgtr(uplo, q, tau, qr_work)               // Q from sytrd's reflectors
 steqr(d, e, z)                             // Result: T's eigenvalues, its vectors carried into z
 sterf(d, e)                                // Result: T's eigenvalues alone
+gesvd(SvdJob.Thin, SvdJob.Full, a, s, u, vt, svd_work)  // Result: A = U Σ Vᵀ, s descending
+gesvd(SvdJob.Omit, SvdJob.Omit, a, s, u, vt, svd_work)  // the singular values alone
+gebrd(a, d, e, tauq, taup, work)           // Qᵀ A P = B: upper bidiagonal if tall, lower if wide
+orgbr(Reflectors.Q, q, k, tauq, qr_work)   // Q from gebrd's reflectors; Reflectors.P gives Pᵀ
+bdsqr(d, e, vt, u)                         // Result: B's singular values, Pᵀ into vt, Q into u
 ```
 
 **Workspace is the caller's, as in sblas.** `getrf` and `getrs` take sblas's `GemmWork` packing buffers
@@ -62,10 +67,14 @@ the packing buffers, so they take a `QrWork(block, gemm)`, sized by `geqrf_work_
 the unblocked `geqr2` and `org2r` take one vector of `a.cols`. `syev` takes a `SyevWork(tri, qr)`
 sized by `syev_work_len[T](eigen, n)`: `tri` holds T's off-diagonal, the reflectors' scales and
 `sytrd`'s two vectors, and `qr` is `orgtr`'s `QrWork` (`orgtr_work_len[T](n)`), empty for `Values`;
-`sytrd` takes one vector of `sytrd_work_len[T](n)`, and `steqr` and `sterf` take none.
+`sytrd` takes one vector of `sytrd_work_len[T](n)`, and `steqr` and `sterf` take none. `gesvd` takes
+an `SvdWork(bidiag, qr)` sized by `gesvd_work_len[T](jobu, jobvt, m, n)`: `bidiag` holds B's
+off-diagonal, both reflectors' scales and `gebrd`'s vector, 3 min(m, n) − 1 + max(m, n), and `qr`
+is the larger of `orgbr`'s for the vectors asked for (`orgbr_work_len[T](vect, m, n, k)`), empty for
+neither; `gebrd` takes one vector of `gebrd_work_len[T](m, n)`, and `bdsqr` none.
 `sh.sysl.slapack.heap` holds `getrf_alloc`, `getrs_alloc`, `potrf_alloc`, `potrs_alloc`,
-`geqrf_alloc`, `orgqr_alloc`, `ormqr_alloc`, `sytrd_alloc`, `orgtr_alloc` and `syev_alloc`, which
-allocate the buffers per call.
+`geqrf_alloc`, `orgqr_alloc`, `ormqr_alloc`, `sytrd_alloc`, `orgtr_alloc`, `syev_alloc`,
+`gebrd_alloc`, `orgbr_alloc` and `gesvd_alloc`, which allocate the buffers per call.
 
 **The triangle is an `Uplo`, sblas's own enum.** Unlike `getrs`'s `Transpose`, it could have been a
 view: the upper triangle of A is the lower triangle of `a.t()`, and the upper factor is the transposed
@@ -99,10 +108,11 @@ positive definite, an iteration that did not converge). slapack separates them.
   own `xerbla` stops the program for them too.
 
 `Error` is an enum so that each family adds its own variants (`NotPositiveDefinite` for `potrf`,
-`NoConvergence(unconverged)` for `syev`, `steqr` and `sterf`, and later `gesvd`) rather than a second
+`NoConvergence(unconverged)` for `syev`, `steqr`, `sterf`, `gesvd` and `bdsqr`) rather than a second
 error type per routine. `NoConvergence` carries LAPACK's positive `info`: how many off-diagonal
-elements of T were still not zero after 30 n sweeps. As in LAPACK the eigenvalues are then left
-unsorted, as the iteration reached them.
+elements of T (or of the bidiagonal B) were still not zero after 30 n sweeps (6 n² inner steps for
+`bdsqr`). As in LAPACK the eigenvalues or singular values are then left unsorted, as the iteration
+reached them.
 
 **The QR routines answer nothing.** Every matrix has a QR factorisation, so `dgeqrf`'s `info` is only
 ever about the arguments: here those trap — a `tau` shorter than `min(m, n)`, a Q with more columns
@@ -254,6 +264,58 @@ reduction into T, no off-diagonal element is ever negligible, and the iteration 
 which is what the platform's `dsyev` answers too. A NaN that leaves only a 2 x 2 block unreduced is
 solved outright, NaN eigenvalues and `Ok`, as in LAPACK.
 
+## The singular value decomposition
+
+`gesvd` takes LAPACK's path, `dgesvd`'s for a matrix whose shorter side is not much shorter (LAPACK
+first takes the QR factorisation of a much taller A; slapack does not). A matrix whose largest
+element lies outside [√safmin / ε, ε / √safmin] is scaled into it first, and its singular values
+scaled back after. Then, for `m >= n`:
+
+1. `gebrd` reduces A to an upper bidiagonal B = Qᵀ A P by `n` reflections from the left and `n − 1`
+   from the right, LAPACK's `gebd2`: H(i) zeroes column `i` below the diagonal and is applied to the
+   columns right of it, then G(i) zeroes row `i` right of the superdiagonal and is applied to the rows
+   below it. A reflection from the right is the left one of the transposed view, so both are the QR
+   family's `larfg` and `larf`;
+2. `orgbr` forms the columns of Q asked for, from the reflectors below the diagonal (`orgqr`), and Pᵀ
+   from those right of the superdiagonal — which, read in `a.t()`, lie where `sytrd`'s do, so Pᵀ is
+   `orgtr`'s shifted `orgqr` on the transposed view;
+3. `bdsqr` diagonalises B by the implicit QR iteration of Demmel and Kahan, carrying each rotation into
+   the rows of Vᵀ and the columns of U, then makes every value non-negative (its row of Vᵀ taking the
+   sign) and sorts them descending, by selection so that each vector moves at most once.
+
+A wide A is decomposed as its transpose: Aᵀ = V Σ Uᵀ is the tall problem, whose U is the view
+`vt.t()` and whose Vᵀ is `u.t()`, so the iteration only ever sees an upper B and the jobs trade
+places. LAPACK reduces a wide A to a lower B and rotates it upper inside `bdsqr`; its vectors may
+differ from these in sign, and the values do not. `gebrd` alone keeps LAPACK's layout for a wide A —
+lower bidiagonal, Q's reflectors below the subdiagonal and P's right of the diagonal — computed as
+the upper reduction of `a.t()` with the two scales' roles exchanged, which is exactly LAPACK's
+arithmetic. `orgbr` takes LAPACK's `k` explicitly rather than as `tau.len`, since from a wide
+reduction Q is formed from `m − 1` of `m` scales.
+
+`bdsqr` is LAPACK's step for step: the absolute threshold from an estimate of the smallest singular
+value; splitting wherever an off-diagonal element is negligible; a 2 x 2 block solved outright
+(`lasv2`); the chase from whichever end of the block has the larger diagonal element, with that
+direction's relative convergence test; and the shift — the smaller singular value of the 2 x 2 at the
+far end (`las2`) — set to zero where it would cost the small values their relative accuracy, so that
+the zero-shift sweep keeps every value, however small, to a few ulps of itself. The rotations are LAPACK
+3.10's `lartg`, shared with `steqr`. As in `steqr`, each rotation is applied as it is made, in the
+order `dlasr` would apply the saved ones, so `bdsqr` needs no workspace, and the values alone are the
+same iteration with no vectors: bit for bit the values the vectors path gives. LAPACK runs dqds
+(`dlasq1`) for the values alone instead; slapack does not have it.
+
+**With no singular values a `Full` U or Vᵀ is the identity.** LAPACK returns at once for `m = 0` or
+`n = 0` and leaves them as they were; an m x m U of an m x 0 A is still asked to be orthogonal, so
+slapack writes it.
+
+**A NaN ends in `NoConvergence`**, from either job: no off-diagonal element is ever negligible, and the
+iteration runs out of steps. Only a block of order two is solved outright, NaN values and `Ok`.
+
+**Two of the iteration's choices change only how fast it converges.** `las2` is only ever a shift, and
+a wrong shift is still an orthogonal step, so the tests check `las2` on its own against the closed
+form. The direction of the chase is chosen for speed too: chasing a block from its smaller end, with
+the convergence test flipped to match, gives the same values and vectors within rounding — the one
+mutation of the pass that no test can see.
+
 ## Oracles
 
 `sysl test .` checks the routines against their definitions: systems factored and solved by hand,
@@ -309,6 +371,34 @@ achieves, since the matrices above are handled by the iteration's scaling alone;
 with the matrix alone and nothing around it touched; a row-major view; and a trap for every call that
 is wrong.
 
+The singular value decomposition is checked by LAPACK's measures: ‖A − U Σ Vᵀ‖ / (max(m, n) ‖A‖ ε),
+‖I − Uᵀ U‖ / (m ε) and ‖I − V Vᵀ‖ / (n ε) for `gesvd` with whole and with thin vectors, and ‖A − Q B
+Pᵀ‖ / (max(m, n) ‖A‖ ε) with Q's and Pᵀ's orthogonality for `gebrd` and `orgbr` — all under 30, on
+random matrices of every square order 1 to 64, 65, 100, 128 and 129, every shape up to 12 x 12, and
+300 x 100, 150 x 70, 200 x 65, 130 x 3 and their transposes, at f32 and f64, with the padding, every
+workspace and everything `orgbr` is not given NaN. The values come back non-negative and descending
+and the same, bit for bit, from every job; U formed alone is U formed beside Vᵀ, and the other way
+round; every τ is zero or in [1, 2], the unused one zero, and B is left in A. Exactly, or within 4 ε:
+a 2 x 2 worked by hand; twenty 2 x 2 bidiagonals through every branch of `lasv2` and `las2`; a
+diagonal matrix, square, tall and wide, whose values are its diagonal's magnitudes sorted and whose
+U Σ Vᵀ is A to the last bit; the zero matrix, whose vectors are the identity; an already bidiagonal
+matrix, which `gebrd` returns bit for bit with every τ zero; order one. Within the threshold: repeated
+values (clusters of four, three and two), rank-deficient products, the all-ones matrix, 2^±900 (f64)
+and 2^±60 (f32) times a random matrix, a column within √2 of overflow, where `larfg`'s α − β would
+overflow unscaled; a subnormal matrix, whose values are within two subnormal units of the unscaled
+ones'; graded bidiagonals and their mirror images, chased from either end, whose values must agree
+relative to themselves; f32 bidiagonals — graded, random, and with a tiny value hidden behind large
+ends, where only the zero-shift test keeps it — against the same in f64, each value relative to
+itself; a NaN answering `NoConvergence` from every job and from `bdsqr`; empty input; a block of a
+larger matrix into blocks of larger U and Vᵀ, bit for bit with the matrix alone and nothing around any
+of them touched; row-major views; and a trap for every call that is wrong. Each of 26 mutations of the
+routines — the reduction's right-hand reflection and its unused scale, `orgbr`'s transposes, `las2`,
+`lasv2`'s signs, swap and rotation, each sweep's rotations into U and Vᵀ, the shifted step, the
+zero-shift guard, the relative convergence test, the split threshold, the 2 x 2's order, the signs
+and the sort, the scaling and its undoing at either end, the wide transposition, the reflectors'
+copy, the identity of no values and the convergence count — turns at least one test red, but the
+chase's direction (above).
+
 `oracle/`, a project of its own so that the package links nothing, factors the same random matrices
 with the platform's `dgetrf` and `sgetrf` through the [lapack](https://github.com/sysl-lang/lapack)
 binding (Accelerate on macOS) and requires the same pivots, the same first zero pivot, and every factor
@@ -336,6 +426,17 @@ its eigenvalue's gap to the nearest other one — how far rounding can turn an e
 platform's `Upper` reduction differs from slapack's (see above), so this compares the results and not
 the intermediate T. A matrix holding a NaN makes both answer that the iteration did not converge
 (`info > 0`), from either triangle and either path (sysl 0.8.3, macOS).
+
+For the singular value decomposition the oracle runs the platform's `dgesvd` and `sgesvd` — through
+the binding's own declarations of `dgesvd_` and `sgesvd_` in `sh.sysl.lapack.c` — on random matrices of every square
+order 1 to 64, 65, 100, 128 and 129, and 150 x 70, 200 x 65, 130 x 3, 300 x 100 and their
+transposes, with every vector and with none. Every singular value agrees within 64 max(m, n) ε ‖A‖₁,
+the values alone too, and each of the first min(m, n) columns of U and rows of Vᵀ, up to the sign the
+pair shares, within that over its value's gap to the nearest other one — and to zero where U or V
+has columns past min(m, n). **Accelerate's `dgesvd` without vectors answers success on a NaN**: it
+runs dqds (`dlasq1`), whose `dlascl` refuses the NaN scale through `xerbla` — two lines printed to the
+terminal, and not fatal — and `info` comes back 0 with NaN among the values. With vectors it answers
+`info > 0`, as slapack's does from either job (sysl 0.8.3, macOS).
 
 ## Gaps found so far
 

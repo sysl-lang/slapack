@@ -2,7 +2,7 @@ module sh.sysl.slapack.heap
 @tests
 
 import sh.sysl.sblas.{Side, Uplo, matrix, matrix_mut}
-import sh.sysl.slapack.{Error, Transpose, Eigen}
+import sh.sysl.slapack.{Error, Transpose, Eigen, SvdJob, Reflectors}
 import sysl.buf.{Buf, buf_filled}
 
 // The allocating forms agree with the core routines, which tests_lu checks against their definitions;
@@ -164,3 +164,77 @@ heap_syev_nan()
     var e: [1]f64 = [9]
     assert(syev_alloc(Eigen.Vectors, Uplo.Upper, matrix_mut(e[0..<0], 0, 0, 1), e[0..<0]) == Ok(()))
     assert(e[0] == 9)
+
+/** The 100 x 40 test matrix of the singular value decomposition, from the symmetric one's pattern. */
+private tall(m: usize, n: usize) -> Buf[f64]
+    val s: Buf[f64] = buf_filled(m * n, 0)
+    for j in 0..<n
+        for i in 0..<m
+            s[i + j * m] = (if i == j then f64(i + 1) else 0) + (f64((i * 7 + j * 5) % 11) - 5) / 1000
+    s
+
+@test("gesvd_alloc on a tall and a wide matrix, past orgqr's block: A = U Σ Vᵀ, and the values alone agree")
+heap_gesvd()
+    val m: usize = 100
+    val n: usize = 40
+    val a = tall(m, n)
+    for wide in [false, true]
+        val (r, c) = if wide then (n, m) else (m, n)
+        // The wide matrix is the tall one's transpose, read row-major.
+        val f = tall(m, n)
+        val g = tall(m, n)
+        val fv = matrix_mut(f.view(), m, n, m)
+        val gv = matrix_mut(g.view(), m, n, m)
+        val u: Buf[f64] = buf_filled(r * r, 0)
+        val vt: Buf[f64] = buf_filled(c * c, 0)
+        val s: Buf[f64] = buf_filled(n, 0)
+        val only: Buf[f64] = buf_filled(n, 0)
+        assert(gesvd_alloc(SvdJob.Full, SvdJob.Full, if wide then fv.t() else fv, s.view(), matrix_mut(u.view(), r, r, r), matrix_mut(vt.view(), c, c, c)) == Ok(()))
+        assert(gesvd_alloc(SvdJob.Omit, SvdJob.Omit, if wide then gv.t() else gv, only.view(), matrix_mut(u.view()[0..<0], 0, 0, 1), matrix_mut(vt.view()[0..<0], 0, 0, 1)) == Ok(()))
+        for k in 0..<n do assert(s[k] == only[k])
+        for j in 0..<c
+            for i in 0..<r
+                var x: f64 = 0
+                for p in 0..<n do x += u[i + p * r] * s[p] * vt[p + j * c]
+                val want = if wide then a[j + i * m] else a[i + j * m]
+                assert((x - want).abs() < 1e-12)
+
+@test("gebrd_alloc and orgbr_alloc reduce a tall matrix past orgqr's block: Qᵀ A P is the bidiagonal B")
+heap_gebrd()
+    val m: usize = 100
+    val n: usize = 40
+    val a = tall(m, n)
+    val f = tall(m, n)
+    val d: Buf[f64] = buf_filled(n, 0)
+    val e: Buf[f64] = buf_filled(n - 1, 0)
+    val tauq: Buf[f64] = buf_filled(n, 0)
+    val taup: Buf[f64] = buf_filled(n, 0)
+    gebrd_alloc(matrix_mut(f.view(), m, n, m), d.view(), e.view(), tauq.view(), taup.view())
+    val q = copy(f)
+    val pt: Buf[f64] = buf_filled(n * n, 0)
+    for j in 0..<n
+        for i in 0..<j do pt[i + j * n] = f[i + j * m]
+    orgbr_alloc(Reflectors.Q, matrix_mut(q.view(), m, n, m), n, tauq.view())
+    orgbr_alloc(Reflectors.P, matrix_mut(pt.view(), n, n, n), m, taup.view())
+    for j in 0..<n
+        for i in 0..<n
+            var x: f64 = 0
+            for p in 0..<m
+                for r in 0..<n do x += q[p + i * m] * a[p + r * m] * pt[j + r * n]
+            val b = if i == j then d[i] else if j == i + 1 then e[i] else 0
+            assert((x - b).abs() < 1e-12)
+
+/** A copy of `b`. */
+private copy(b: Buf[f64]) -> Buf[f64]
+    val c: Buf[f64] = buf_filled(b.len(), 0)
+    for i in 0..<b.len() do c[i] = b[i]
+    c
+
+@test("gesvd_alloc passes NoConvergence through on a NaN, and on empty input needs nothing")
+heap_gesvd_nan()
+    var s: [12]f64 = [1, 2, f64.nan(), 4, 5, 6, 7, 8, 9, 1, 2, 4]
+    var w: [3]f64
+    var none: [1]f64 = [9]
+    assert(gesvd_alloc(SvdJob.Omit, SvdJob.Omit, matrix_mut(s[..], 4, 3, 4), w[..], matrix_mut(none[0..<0], 0, 0, 1), matrix_mut(none[0..<0], 0, 0, 1)) is Err(Error.NoConvergence(_)))
+    assert(gesvd_alloc(SvdJob.Thin, SvdJob.Thin, matrix_mut(none[0..<0], 0, 0, 1), none[0..<0], matrix_mut(none[0..<0], 0, 0, 1), matrix_mut(none[0..<0], 0, 0, 1)) == Ok(()))
+    assert(none[0] == 9)

@@ -23,10 +23,11 @@ enum Error derives Eq
      * the value that was not positive.
      */
     NotPositiveDefinite(index: usize)
-    /** The QL/QR iteration of `steqr` or `sterf` did not converge: after 30 n sweeps, `unconverged`
-     * elements of the tridiagonal form's off-diagonal were still not zero (LAPACK's `info`). The
-     * diagonal holds what the iteration reached, unsorted, and the vectors the rotations made so far;
-     * a NaN in the matrix ends here, as it does in LAPACK.
+    /** The QL/QR iteration of `steqr` or `sterf`, or the QR iteration of `bdsqr`, did not converge:
+     * after 30 n sweeps (6 n² inner steps for `bdsqr`), `unconverged` elements of the tridiagonal or
+     * bidiagonal form's off-diagonal were still not zero (LAPACK's `info`). The diagonal holds what the
+     * iteration reached, unsorted, and the vectors the rotations made so far; a NaN in the matrix ends
+     * here, as it does in LAPACK.
      */
     NoConvergence(unconverged: usize)
 
