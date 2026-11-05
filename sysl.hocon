@@ -3,12 +3,12 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       slapack { git = "github.com/sysl-lang/slapack", version = "0.1.0" }
+//       slapack { git = "github.com/sysl-lang/slapack", version = "0.1.1" }
 //     }
 //
 // The coordinate names the package, `slapack`; the module a program imports is `sh.sysl.slapack`.
 
-package { name = "slapack", version = "0.1.0", sysl = "0.8.3" }
+package { name = "slapack", version = "0.1.1", sysl = "0.9.0" }
 optimization = "2"
 
 // `oracle` checks the factorisations against the platform's LAPACK through the `lapack` binding, in a

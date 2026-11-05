@@ -198,7 +198,7 @@ eig_random_large_f32()
  * eigenvector of `lo`, `(x, y)` (that of `hi` is `(y, −x)` up to sign), all within 2 ε.
  */
 private check_two[T: Real](a: T, b: T, c: T, lo: T, hi: T, x: T, y: T)
-    val tol = T(2) * T.epsilon() * max(lo.abs(), hi.abs())
+    val tol = T(2) * T.epsilon() * lo.abs().max(hi.abs())
     for uplo in [Uplo.Lower, Uplo.Upper]
         var s: [4]T = [a, b, b, c]
         if uplo == Uplo.Lower then s[2] = T.nan() else s[1] = T.nan()

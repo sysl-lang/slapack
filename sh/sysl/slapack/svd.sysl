@@ -137,7 +137,7 @@ orgbr[T: Real](vect: Reflectors, a: MatrixMut[T], k: usize, tau: []const T, work
  */
 private[slapack] las2[T: Real](f: T, g: T, h: T) -> T
     val (fa, ga, ha) = (f.abs(), g.abs(), h.abs())
-    val (fhmn, fhmx) = (min(fa, ha), max(fa, ha))
+    val (fhmn, fhmx) = (fa.min(ha), fa.max(ha))
     if fhmn == T.zero() then return T.zero()
     // sa and ta are 1 ± fhmn / fhmx.
     val sa = T.one() + fhmn / fhmx
@@ -228,7 +228,7 @@ private iterate[T: Real](d: []T, e: []T, vt: MatrixMut[T], u: MatrixMut[T]) -> u
     val eps = unit_roundoff[T]()
     val hundredth = T.one() / T(100)
     // LAPACK's tolmul, ε^(−1/8) kept within [10, 100], times ε: the relative accuracy sought.
-    val tol = max(T(10), min(T(100), T.one() / eps.sqrt().sqrt().sqrt())) * eps
+    val tol = T(10).max(T(100).min(T.one() / eps.sqrt().sqrt().sqrt())) * eps
     // An estimate of the smallest singular value, which sets the absolute threshold below which an
     // off-diagonal element is negligible.
     var sminoa = d[0].abs()
@@ -236,10 +236,10 @@ private iterate[T: Real](d: []T, e: []T, vt: MatrixMut[T], u: MatrixMut[T]) -> u
         var mu = sminoa
         for i in 1..<n
             mu = d[i].abs() * (mu / (mu + e[i - 1].abs()))
-            sminoa = min(sminoa, mu)
+            sminoa = sminoa.min(mu)
             if sminoa == T.zero() then break
     sminoa = sminoa / T(n).sqrt()
-    val thresh = max(tol * sminoa, T(svd_sweeps) * (T(n) * (T(n) * T.safe_min())))
+    val thresh = (tol * sminoa).max(T(svd_sweeps) * (T(n) * (T(n) * T.safe_min())))
     val maxit = svd_sweeps * n * n
     var iter: usize = 0
     var oldll: int = -1
@@ -259,7 +259,7 @@ private iterate[T: Real](d: []T, e: []T, vt: MatrixMut[T], u: MatrixMut[T]) -> u
                 e[i] = T.zero()
                 ll = i + 1
                 break
-            smax = max(smax, max(d[i].abs(), abse))
+            smax = smax.max(d[i].abs().max(abse))
         if ll == m
             // d[m] has converged.
             m -= 1
@@ -292,7 +292,7 @@ private iterate[T: Real](d: []T, e: []T, vt: MatrixMut[T], u: MatrixMut[T]) -> u
                     split = true
                     break
                 mu = d[i + 1].abs() * (mu / (mu + e[i].abs()))
-                smin = min(smin, mu)
+                smin = smin.min(mu)
         else
             if e[ll].abs() <= tol * d[ll].abs()
                 e[ll] = T.zero()
@@ -306,13 +306,13 @@ private iterate[T: Real](d: []T, e: []T, vt: MatrixMut[T], u: MatrixMut[T]) -> u
                     split = true
                     break
                 mu = d[i].abs() * (mu / (mu + e[i].abs()))
-                smin = min(smin, mu)
+                smin = smin.min(mu)
         if split then continue
         oldll = int(ll)
         oldm = int(m)
         // The shift, from the 2 x 2 at the far end — zero where it would cost relative accuracy.
         var shift = T.zero()
-        if !(T(n) * tol * (smin / smax) <= max(eps, hundredth * tol))
+        if !(T(n) * tol * (smin / smax) <= eps.max(hundredth * tol))
             val sll = if forward then d[ll].abs() else d[m].abs()
             shift = if forward then las2(d[m - 1], e[m - 1], d[m]) else las2(d[ll], e[ll], d[ll + 1])
             if sll > T.zero() && (shift / sll) * (shift / sll) < eps then shift = T.zero()

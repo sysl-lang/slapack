@@ -67,7 +67,7 @@ private[slapack] lapy2[T: Real](x: T, y: T) -> T
     if x.is_nan() then return x
     if y.is_nan() then return y
     val (xa, ya) = (x.abs(), y.abs())
-    val (w, z) = (max(xa, ya), min(xa, ya))
+    val (w, z) = (xa.max(ya), xa.min(ya))
     if z == T.zero() || w > T.max_value() then return w
     val q = z / w
     w * (T.one() + q * q).sqrt()

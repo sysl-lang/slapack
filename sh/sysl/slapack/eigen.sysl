@@ -46,10 +46,10 @@ private lanst[T: Real](d: []const T, e: []const T) -> T
     var most = T.zero()
     for x in d
         if x.is_nan() then return x
-        most = max(most, x.abs())
+        most = most.max(x.abs())
     for x in e
         if x.is_nan() then return x
-        most = max(most, x.abs())
+        most = most.max(x.abs())
     most
 
 /** Multiplies `x` by `cto / cfrom` without overflow or underflow on the way, LAPACK's `lascl`: in steps
@@ -95,7 +95,7 @@ private[slapack] lartg[T: Real](f: T, g: T) -> (T, T, T)
         val d = (f * f + g * g).sqrt()
         val r = d.copysign(f)
         return (f1 / d, g / r, r)
-    val u = min(safmax, max(safmin, max(f1, g1)))
+    val u = safmax.min(safmin.max(f1.max(g1)))
     val (fs, gs) = (f / u, g / u)
     val d = (fs * fs + gs * gs).sqrt()
     val r = d.copysign(f)
