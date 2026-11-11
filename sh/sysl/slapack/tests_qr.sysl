@@ -16,26 +16,26 @@ import sysl.math.min
 /** geqrf in a workspace of exactly the length geqrf_work_len gives, every element NaN. */
 private factor_qr[T: Real](a: MatrixMut[T], tau: []T)
     val len = geqrf_work_len[T](a.rows, a.cols)
-    val block: Buf[T] = buf_filled(len.block, T.nan())
-    val pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
-    val pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
-    geqrf(a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    var block: Buf[T] = buf_filled(len.block, T.nan())
+    var pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
+    var pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
+    geqrf(a, tau, QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())))
 
 /** orgqr in a workspace of exactly the length orgqr_work_len gives, every element NaN. */
 private form_qr[T: Real](a: MatrixMut[T], tau: []const T)
     val len = orgqr_work_len[T](a.rows, a.cols, tau.len)
-    val block: Buf[T] = buf_filled(len.block, T.nan())
-    val pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
-    val pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
-    orgqr(a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    var block: Buf[T] = buf_filled(len.block, T.nan())
+    var pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
+    var pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
+    orgqr(a, tau, QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())))
 
 /** ormqr in a workspace of exactly the length ormqr_work_len gives, every element NaN. */
 private apply_qr[T: Real](side: Side, trans: Transpose, a: Matrix[T], tau: []const T, c: MatrixMut[T])
     val len = ormqr_work_len[T](side, c.rows, c.cols, tau.len)
-    val block: Buf[T] = buf_filled(len.block, T.nan())
-    val pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
-    val pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
-    ormqr(side, trans, a, tau, c, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    var block: Buf[T] = buf_filled(len.block, T.nan())
+    var pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
+    var pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
+    ormqr(side, trans, a, tau, c, QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())))
 
 /** A copy of `s`. */
 private[slapack] copy_of[T: Real](s: []const T) -> Buf[T]
@@ -110,9 +110,9 @@ private product_ratio[T: Real](side: Side, trans: Transpose, q: Matrix[T], c: Ma
  */
 private check_qr_of[T: Real](a: []const T, m: usize, n: usize, ld: usize, seed: u64)
     val k = min(m, n)
-    val f = copy_of(a)
-    val tau: Buf[T] = buf_filled(k + 1, T.nan())
-    factor_qr(matrix_mut(f.view(), m, n, ld), tau.view())
+    var f = copy_of(a)
+    var tau: Buf[T] = buf_filled(k + 1, T.nan())
+    factor_qr(matrix_mut(f.view_mut(), m, n, ld), tau.view_mut())
     assert(padding_kept(f.view(), m, n, ld), s"geqrf wrote past its matrix at $m x $n")
     assert(tau[k].is_nan(), s"geqrf wrote past tau[min(m, n)] at $m x $n")
     for i in 0..<k
@@ -122,8 +122,8 @@ private check_qr_of[T: Real](a: []const T, m: usize, n: usize, ld: usize, seed: 
     val taus = tau.view()[0..<k]
     // The whole of Q, m x m.
     val ldq = m + 2
-    val q = reflectors(fm, k, m, ldq)
-    form_qr(matrix_mut(q.view(), m, m, ldq), taus)
+    var q = reflectors(fm, k, m, ldq)
+    form_qr(matrix_mut(q.view_mut(), m, m, ldq), taus)
     assert(padding_kept(q.view(), m, m, ldq), s"orgqr wrote past its matrix at $m x $n")
     val qm = matrix(q.view(), m, m, ldq)
     val r = qr_ratio(am, qm, fm)
@@ -132,8 +132,8 @@ private check_qr_of[T: Real](a: []const T, m: usize, n: usize, ld: usize, seed: 
     assert(o < T(threshold), s"‖I − Qᵀ Q‖ / (m ε) = ${f64(o)} at $m x $n")
     if m > n
         // The thin Q, m x n, from the same reflectors.
-        val thin = reflectors(fm, k, n, m + 1)
-        form_qr(matrix_mut(thin.view(), m, n, m + 1), taus)
+        var thin = reflectors(fm, k, n, m + 1)
+        form_qr(matrix_mut(thin.view_mut(), m, n, m + 1), taus)
         assert(padding_kept(thin.view(), m, n, m + 1), s"orgqr wrote past the thin Q at $m x $n")
         val tm = matrix(thin.view(), m, n, m + 1)
         val rt = qr_ratio(am, tm, fm)
@@ -147,8 +147,8 @@ private check_qr_of[T: Real](a: []const T, m: usize, n: usize, ld: usize, seed: 
         for trans in [Transpose.NoTrans, Transpose.Trans]
             val (rows, cols) = if side == Side.Left then (m, p) else (p, m)
             val c = random[T](&g, rows, cols, rows + 1, T.nan())
-            val d = copy_of(c.view())
-            apply_qr(side, trans, fm, taus, matrix_mut(d.view(), rows, cols, rows + 1))
+            var d = copy_of(c.view())
+            apply_qr(side, trans, fm, taus, matrix_mut(d.view_mut(), rows, cols, rows + 1))
             assert(padding_kept(d.view(), rows, cols, rows + 1), s"ormqr wrote past C at $m x $n")
             val pr = product_ratio(side, trans, qm, matrix(c.view(), rows, cols, rows + 1), matrix(d.view(), rows, cols, rows + 1))
             assert(pr < T(threshold), s"‖op(Q) C − ormqr‖ / (max(m, p) ‖C‖ ε) = ${f64(pr)} at $m x $n")
@@ -255,12 +255,12 @@ qr_already_triangular()
     val orders: [2]usize = [5, 100]
     for n in orders
         var g = Stream(u64(n))
-        val a = random[f64](&g, n, n, n, 0)
+        var a = random[f64](&g, n, n, n, 0)
         for j in 0..<n
             for i in j + 1..<n do a[i + j * n] = 0
-        val f = copy_of(a.view())
-        val tau: Buf[f64] = buf_filled(n, f64.nan())
-        factor_qr(matrix_mut(f.view(), n, n, n), tau.view())
+        var f = copy_of(a.view())
+        var tau: Buf[f64] = buf_filled(n, f64.nan())
+        factor_qr(matrix_mut(f.view_mut(), n, n, n), tau.view_mut())
         for i in 0..<n * n
             assert(f[i] == a[i])
         for t in tau.view()
@@ -270,16 +270,16 @@ qr_already_triangular()
 qr_zero_matrix()
     val shapes: [3](usize, usize) = [(4, 3), (70, 90), (90, 70)]
     for (m, n) in shapes
-        val f: Buf[f32] = buf_filled(m * n, 0)
+        var f: Buf[f32] = buf_filled(m * n, 0)
         val k = min(m, n)
-        val tau: Buf[f32] = buf_filled(k, f32.nan())
-        factor_qr(matrix_mut(f.view(), m, n, m), tau.view())
+        var tau: Buf[f32] = buf_filled(k, f32.nan())
+        factor_qr(matrix_mut(f.view_mut(), m, n, m), tau.view_mut())
         for v in f.view()
             assert(v == 0)
         for t in tau.view()
             assert(t == 0)
-        val q = reflectors(matrix(f.view(), m, n, m), k, m, m)
-        form_qr(matrix_mut(q.view(), m, m, m), tau.view())
+        var q = reflectors(matrix(f.view(), m, n, m), k, m, m)
+        form_qr(matrix_mut(q.view_mut(), m, m, m), tau.view())
         for j in 0..<m
             for i in 0..<m
                 assert(q[i + j * m] == (if i == j then 1 else 0))
@@ -295,9 +295,9 @@ private check_qr_zero_columns[T: Real](m: usize, n: usize, zeros: []const usize,
     val a = random[T](&g, m, n, ld, T.nan())
     for c in zeros
         for i in 0..<m do a[i + c * ld] = T.zero()
-    val f = copy_of(a.view())
-    val tau: Buf[T] = buf_filled(min(m, n), T.nan())
-    factor_qr(matrix_mut(f.view(), m, n, ld), tau.view())
+    var f = copy_of(a.view())
+    var tau: Buf[T] = buf_filled(min(m, n), T.nan())
+    factor_qr(matrix_mut(f.view_mut(), m, n, ld), tau.view_mut())
     for c in zeros
         if c < tau.len() then assert(tau[c] == T.zero(), s"τ $c of a zero column is not zero at $m x $n")
         for i in 0..<min(c + 1, m)
@@ -356,10 +356,10 @@ qr_nan()
     val orders: [2]usize = [4, 80]
     for n in orders
         var g = Stream(u64(n))
-        val a = random[f64](&g, n, n, n, 0)
+        var a = random[f64](&g, n, n, n, 0)
         a[0] = f64.nan()
-        val tau: Buf[f64] = buf_filled(n, 0)
-        factor_qr(matrix_mut(a.view(), n, n, n), tau.view())
+        var tau: Buf[f64] = buf_filled(n, 0)
+        factor_qr(matrix_mut(a.view_mut(), n, n, n), tau.view_mut())
         assert(a[0].is_nan() && a[n * n - 1].is_nan())
 
 // --- Empty input ------------------------------------------------------------------------------------
@@ -395,17 +395,17 @@ qr_block_view()
     val m: usize = 140
     val n: usize = 110
     var g = Stream(11)
-    val alone = random[f64](&g, m, n, m, 0)
+    var alone = random[f64](&g, m, n, m, 0)
     val ld: usize = 170
-    val big: Buf[f64] = buf_filled(ld * (n + 5), f64.nan())
+    var big: Buf[f64] = buf_filled(ld * (n + 5), f64.nan())
     for j in 0..<n
         for i in 0..<m
             big[(i + 20) + (j + 5) * ld] = alone[i + j * m]
-    val t1: Buf[f64] = buf_filled(n, 0)
-    val t2: Buf[f64] = buf_filled(n, 0)
-    factor_qr(matrix_mut(alone.view(), m, n, m), t1.view())
-    val view = matrix_mut(big.view(), ld, n + 5, ld).block(20, 5, m, n)
-    factor_qr(view, t2.view())
+    var t1: Buf[f64] = buf_filled(n, 0)
+    var t2: Buf[f64] = buf_filled(n, 0)
+    factor_qr(matrix_mut(alone.view_mut(), m, n, m), t1.view_mut())
+    val view = matrix_mut(big.view_mut(), ld, n + 5, ld).block(20, 5, m, n)
+    factor_qr(view, t2.view_mut())
     for j in 0..<n
         assert(t1[j] == t2[j])
         for i in 0..<m
@@ -414,8 +414,8 @@ qr_block_view()
         for i in 0..<ld
             if !(i >= 20 && i < 20 + m && j >= 5 && j < 5 + n) then assert(big[i + j * ld].is_nan(), "geqrf wrote outside its block")
     // orgqr and ormqr on blocks agree bit for bit too.
-    val q1 = reflectors(matrix(alone.view(), m, n, m), n, n, m)
-    form_qr(matrix_mut(q1.view(), m, n, m), t1.view())
+    var q1 = reflectors(matrix(alone.view(), m, n, m), n, n, m)
+    form_qr(matrix_mut(q1.view_mut(), m, n, m), t1.view_mut())
     form_qr(view, t2.view())
     for j in 0..<n
         for i in 0..<m
@@ -426,17 +426,17 @@ qr_row_major_view()
     val m: usize = 90
     val n: usize = 70
     var g = Stream(5)
-    val a = random[f64](&g, m, n, m, 0)
+    var a = random[f64](&g, m, n, m, 0)
     // The same matrix stored row-major: element (i, j) at j + i n.
-    val r: Buf[f64] = buf_filled(m * n, 0)
+    var r: Buf[f64] = buf_filled(m * n, 0)
     for j in 0..<n
         for i in 0..<m do r[j + i * n] = a[i + j * m]
-    val t1: Buf[f64] = buf_filled(n, 0)
-    val t2: Buf[f64] = buf_filled(n, 0)
-    val f = copy_of(a.view())
-    factor_qr(matrix_mut(f.view(), m, n, m), t1.view())
-    val rv = matrix_mut(r.view(), n, m, n).t()
-    factor_qr(rv, t2.view())
+    var t1: Buf[f64] = buf_filled(n, 0)
+    var t2: Buf[f64] = buf_filled(n, 0)
+    var f = copy_of(a.view())
+    factor_qr(matrix_mut(f.view_mut(), m, n, m), t1.view_mut())
+    val rv = matrix_mut(r.view_mut(), n, m, n).t()
+    factor_qr(rv, t2.view_mut())
     var most = 0.0
     for v in f.view()
         if v.abs() > most then most = v.abs()
@@ -446,12 +446,12 @@ qr_row_major_view()
         for i in 0..<m
             assert((f[i + j * m] - rv.at(i, j)).abs() <= tol, "a row-major geqrf differs")
     // Q from the row-major reflectors, applied to a row-major C, against the column-major Q C.
-    val c = random[f64](&g, m, 4, m, 0)
-    val cr: Buf[f64] = buf_filled(m * 4, 0)
+    var c = random[f64](&g, m, 4, m, 0)
+    var cr: Buf[f64] = buf_filled(m * 4, 0)
     for j in 0..<4
         for i in 0..<m do cr[j + i * 4] = c[i + j * m]
-    apply_qr(Side.Left, Transpose.NoTrans, matrix(f.view(), m, n, m), t1.view(), matrix_mut(c.view(), m, 4, m))
-    val crv = matrix_mut(cr.view(), 4, m, 4).t()
+    apply_qr(Side.Left, Transpose.NoTrans, matrix(f.view(), m, n, m), t1.view(), matrix_mut(c.view_mut(), m, 4, m))
+    val crv = matrix_mut(cr.view_mut(), 4, m, 4).t()
     apply_qr(Side.Left, Transpose.NoTrans, rv.as_view(), t2.view(), crv)
     for j in 0..<4
         for i in 0..<m
@@ -464,13 +464,13 @@ qr_ormqr_wide_a()
     val m: usize = 40
     val n: usize = 90
     var g = Stream(3)
-    val a = random[f64](&g, m, n, m, 0)
-    val tau: Buf[f64] = buf_filled(m, 0)
-    factor_qr(matrix_mut(a.view(), m, n, m), tau.view())
+    var a = random[f64](&g, m, n, m, 0)
+    var tau: Buf[f64] = buf_filled(m, 0)
+    factor_qr(matrix_mut(a.view_mut(), m, n, m), tau.view_mut())
     // QᵀA = R: the columns of A itself, multiplied by Qᵀ, come out as R.
     var g2 = Stream(3)
-    val orig = random[f64](&g2, m, n, m, 0)
-    apply_qr(Side.Left, Transpose.Trans, matrix(a.view(), m, n, m), tau.view(), matrix_mut(orig.view(), m, n, m))
+    var orig = random[f64](&g2, m, n, m, 0)
+    apply_qr(Side.Left, Transpose.Trans, matrix(a.view(), m, n, m), tau.view(), matrix_mut(orig.view_mut(), m, n, m))
     for j in 0..<n
         for i in 0..<m
             val want = if i <= j then a[i + j * m] else 0
@@ -512,10 +512,10 @@ qr_short_block()
 @test("geqrf traps on gemm buffers shorter than geqrf_work_len says", should_trap)
 qr_short_gemm()
     var g = Stream(2)
-    val a = random[f64](&g, 100, 100, 100, 0)
-    val tau: Buf[f64] = buf_filled(100, 0)
-    val block: Buf[f64] = buf_filled(geqrf_work_len[f64](100, 100).block, 0)
-    geqrf(matrix_mut(a.view(), 100, 100, 100), tau.view(), QrWork(block.view(), work0()))
+    var a = random[f64](&g, 100, 100, 100, 0)
+    var tau: Buf[f64] = buf_filled(100, 0)
+    var block: Buf[f64] = buf_filled(geqrf_work_len[f64](100, 100).block, 0)
+    geqrf(matrix_mut(a.view_mut(), 100, 100, 100), tau.view_mut(), QrWork(block.view_mut(), work0()))
 
 @test("geqr2 traps on a work vector shorter than A's columns", should_trap)
 qr_geqr2_short_work()

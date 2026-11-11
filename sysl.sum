@@ -1,3 +1,4 @@
 github.com/sysl-lang/blas v0.1.0 sha256:7778495870875bd87e43457a5020e38e8ea4fcb8a451c993085163412f22cac2
 github.com/sysl-lang/lapack v0.1.0 sha256:0a25ca5612c593a54bb50f45b8d18b57c65b60c8de45a655fb917b569fab9ad8
+github.com/sysl-lang/lapack v0.1.1 sha256:82c7b54753d4a2f819a3da92baee397ea4a0a650368fe62b0e8dfb82d171df61
 github.com/sysl-lang/sblas v0.4.0 sha256:4df1fa7061bb5b67a8e087898969d5076fcebdba96ad3462d25fb694fc5df307

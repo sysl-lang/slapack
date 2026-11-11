@@ -17,24 +17,24 @@ import sysl.math.max
 /** syev in a workspace of exactly the length syev_work_len gives, every element NaN. */
 private eig[T: Real](eigen: Eigen, uplo: Uplo, a: MatrixMut[T], w: []T) -> Result[unit, Error]
     val len = syev_work_len[T](eigen, a.rows)
-    val tri: Buf[T] = buf_filled(len.tri, T.nan())
-    val block: Buf[T] = buf_filled(len.qr.block, T.nan())
-    val pa: Buf[T] = buf_filled(len.qr.gemm.a, T.nan())
-    val pb: Buf[T] = buf_filled(len.qr.gemm.b, T.nan())
-    syev(eigen, uplo, a, w, SyevWork(tri.view(), QrWork(block.view(), GemmWork(pa.view(), pb.view()))))
+    var tri: Buf[T] = buf_filled(len.tri, T.nan())
+    var block: Buf[T] = buf_filled(len.qr.block, T.nan())
+    var pa: Buf[T] = buf_filled(len.qr.gemm.a, T.nan())
+    var pb: Buf[T] = buf_filled(len.qr.gemm.b, T.nan())
+    syev(eigen, uplo, a, w, SyevWork(tri.view_mut(), QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut()))))
 
 /** sytrd in a work vector of exactly the length sytrd_work_len gives, every element NaN. */
 private reduce[T: Real](uplo: Uplo, a: MatrixMut[T], d: []T, e: []T, tau: []T)
-    val work: Buf[T] = buf_filled(sytrd_work_len[T](a.rows), T.nan())
-    sytrd(uplo, a, d, e, tau, work.view())
+    var work: Buf[T] = buf_filled(sytrd_work_len[T](a.rows), T.nan())
+    sytrd(uplo, a, d, e, tau, work.view_mut())
 
 /** orgtr in a workspace of exactly the length orgtr_work_len gives, every element NaN. */
 private form_tq[T: Real](uplo: Uplo, a: MatrixMut[T], tau: []const T)
     val len = orgtr_work_len[T](a.rows)
-    val block: Buf[T] = buf_filled(len.block, T.nan())
-    val pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
-    val pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
-    orgtr(uplo, a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    var block: Buf[T] = buf_filled(len.block, T.nan())
+    var pa: Buf[T] = buf_filled(len.gemm.a, T.nan())
+    var pb: Buf[T] = buf_filled(len.gemm.b, T.nan())
+    orgtr(uplo, a, tau, QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())))
 
 /** A random symmetric order-`n` matrix, both triangles, column-major in a leading dimension of `ld`,
  * the padding rows NaN.
@@ -119,9 +119,9 @@ private check_eig_of[T: Real](uplo: Uplo, s: []const T, n: usize, ld: usize)
     val at = s"$n from ${if uplo == Uplo.Lower then "Lower" else "Upper"}"
     val anorm = T(max1(n, n)) * norm1(n, n, (i, j) -> a.at(i, j))
     // The eigenvectors.
-    val v = one_triangle(uplo, s, n, ld)
-    val w: Buf[T] = buf_filled(n + 1, T.nan())
-    assert(eig(Eigen.Vectors, uplo, matrix_mut(v.view(), n, n, ld), w.view()) == Ok(()), s"syev failed at $at")
+    var v = one_triangle(uplo, s, n, ld)
+    var w: Buf[T] = buf_filled(n + 1, T.nan())
+    assert(eig(Eigen.Vectors, uplo, matrix_mut(v.view_mut(), n, n, ld), w.view_mut()) == Ok(()), s"syev failed at $at")
     assert(padding_kept(v.view(), n, n, ld), s"syev wrote past its matrix at $at")
     assert(w[n].is_nan(), s"syev wrote past w[n] at $at")
     assert(ascending(w.view(), n), s"the eigenvalues are not ascending at $at")
@@ -131,20 +131,20 @@ private check_eig_of[T: Real](uplo: Uplo, s: []const T, n: usize, ld: usize)
     val o = orth_ratio(vm)
     assert(o < T(threshold), s"‖I − Vᵀ V‖ / (n ε) = ${f64(o)} at $at")
     // The values alone, which leave the other triangle as it was.
-    val f = one_triangle(uplo, s, n, ld)
-    val only: Buf[T] = buf_filled(n + 1, T.nan())
-    assert(eig(Eigen.Values, uplo, matrix_mut(f.view(), n, n, ld), only.view()) == Ok(()), s"syev of the values failed at $at")
+    var f = one_triangle(uplo, s, n, ld)
+    var only: Buf[T] = buf_filled(n + 1, T.nan())
+    assert(eig(Eigen.Values, uplo, matrix_mut(f.view_mut(), n, n, ld), only.view_mut()) == Ok(()), s"syev of the values failed at $at")
     assert(padding_kept(f.view(), n, n, ld) && triangle_kept(uplo, f.view(), n, ld), s"syev of the values wrote outside its triangle at $at")
     assert(only[n].is_nan(), s"syev of the values wrote past w[n] at $at")
     for i in 0..<n
         val d = ratio_of((w[i] - only[i]).abs(), anorm)
         assert(d < T(threshold), s"eigenvalue $i differs between the paths by ${f64(d)} at $at")
     // The reduction and its Q.
-    val q = one_triangle(uplo, s, n, ld)
-    val d: Buf[T] = buf_filled(n + 1, T.nan())
-    val e: Buf[T] = buf_filled(n, T.nan())
-    val tau: Buf[T] = buf_filled(n, T.nan())
-    reduce(uplo, matrix_mut(q.view(), n, n, ld), d.view()[0..<n], e.view()[0..<n - 1], tau.view()[0..<n - 1])
+    var q = one_triangle(uplo, s, n, ld)
+    var d: Buf[T] = buf_filled(n + 1, T.nan())
+    var e: Buf[T] = buf_filled(n, T.nan())
+    var tau: Buf[T] = buf_filled(n, T.nan())
+    reduce(uplo, matrix_mut(q.view_mut(), n, n, ld), d.view_mut()[0..<n], e.view_mut()[0..<n - 1], tau.view_mut()[0..<n - 1])
     assert(padding_kept(q.view(), n, n, ld) && triangle_kept(uplo, q.view(), n, ld), s"sytrd wrote outside its triangle at $at")
     assert(d[n].is_nan() && e[n - 1].is_nan() && tau[n - 1].is_nan(), s"sytrd wrote past a slice at $at")
     for i in 0..<n - 1
@@ -154,7 +154,7 @@ private check_eig_of[T: Real](uplo: Uplo, s: []const T, n: usize, ld: usize)
         assert(beside == e[i], s"A does not hold T's off-diagonal $i at $at")
     for i in 0..<n
         assert(q[i + i * ld] == d[i], s"A does not hold T's diagonal $i at $at")
-    form_tq(uplo, matrix_mut(q.view(), n, n, ld), tau.view()[0..<n - 1])
+    form_tq(uplo, matrix_mut(q.view_mut(), n, n, ld), tau.view()[0..<n - 1])
     assert(padding_kept(q.view(), n, n, ld), s"orgtr wrote past its matrix at $at")
     val qm = matrix(q.view(), n, n, ld)
     val t = tridiagonal_ratio(a, qm, d.view(), e.view())
@@ -233,10 +233,10 @@ eig_diagonal()
     val n: usize = 7
     for uplo in [Uplo.Lower, Uplo.Upper]
         for eigen in [Eigen.Vectors, Eigen.Values]
-            val s: Buf[f64] = buf_filled(n * n, 0)
+            var s: Buf[f64] = buf_filled(n * n, 0)
             for i in 0..<n do s[i + i * n] = diag[i]
-            val w: Buf[f64] = buf_filled(n, f64.nan())
-            assert(eig(eigen, uplo, matrix_mut(s.view(), n, n, n), w.view()) == Ok(()))
+            var w: Buf[f64] = buf_filled(n, f64.nan())
+            assert(eig(eigen, uplo, matrix_mut(s.view_mut(), n, n, n), w.view_mut()) == Ok(()))
             for j in 0..<n
                 assert(w[j] == sorted[j])
                 if eigen == Eigen.Vectors
@@ -246,7 +246,7 @@ eig_diagonal()
 eig_tridiagonal()
     val n: usize = 40
     var g = Stream(17)
-    val s: Buf[f64] = buf_filled(n * n, 0)
+    var s: Buf[f64] = buf_filled(n * n, 0)
     for i in 0..<n
         s[i + i * n] = g.next[f64]()
         if i + 1 < n
@@ -254,11 +254,11 @@ eig_tridiagonal()
             s[i + 1 + i * n] = x
             s[i + (i + 1) * n] = x
     for uplo in [Uplo.Lower, Uplo.Upper]
-        val q = copy_of(s.view())
-        val d: Buf[f64] = buf_filled(n, 0)
-        val e: Buf[f64] = buf_filled(n - 1, 0)
-        val tau: Buf[f64] = buf_filled(n - 1, 0)
-        reduce(uplo, matrix_mut(q.view(), n, n, n), d.view(), e.view(), tau.view())
+        var q = copy_of(s.view())
+        var d: Buf[f64] = buf_filled(n, 0)
+        var e: Buf[f64] = buf_filled(n - 1, 0)
+        var tau: Buf[f64] = buf_filled(n - 1, 0)
+        reduce(uplo, matrix_mut(q.view_mut(), n, n, n), d.view_mut(), e.view_mut(), tau.view_mut())
         for i in 0..<n
             assert(d[i] == s[i + i * n])
             if i + 1 < n then assert(tau[i] == 0 && e[i] == s[i + 1 + i * n])
@@ -269,16 +269,16 @@ eig_identity_and_zero()
     val n: usize = 20
     for one in [1f64, 0]
         for uplo in [Uplo.Lower, Uplo.Upper]
-            val s: Buf[f64] = buf_filled(n * n, 0)
+            var s: Buf[f64] = buf_filled(n * n, 0)
             for i in 0..<n do s[i + i * n] = one
-            val w: Buf[f64] = buf_filled(n, f64.nan())
-            assert(eig(Eigen.Vectors, uplo, matrix_mut(s.view(), n, n, n), w.view()) == Ok(()))
+            var w: Buf[f64] = buf_filled(n, f64.nan())
+            assert(eig(Eigen.Vectors, uplo, matrix_mut(s.view_mut(), n, n, n), w.view_mut()) == Ok(()))
             for j in 0..<n
                 assert(w[j] == one)
                 for i in 0..<n do assert(s[i + j * n] == (if i == j then 1 else 0))
-            val f: Buf[f64] = buf_filled(n * n, 0)
+            var f: Buf[f64] = buf_filled(n * n, 0)
             for i in 0..<n do f[i + i * n] = one
-            assert(eig(Eigen.Values, uplo, matrix_mut(f.view(), n, n, n), w.view()) == Ok(()))
+            assert(eig(Eigen.Values, uplo, matrix_mut(f.view_mut(), n, n, n), w.view_mut()) == Ok(()))
             for j in 0..<n do assert(w[j] == one)
 
 /** Q Λ Q for the Householder Q = I − 2 u uᵀ / uᵀ u of a random u, a symmetric matrix whose
@@ -309,9 +309,9 @@ private check_spectrum[T: Real](lambda: []const T, sorted: []const T, seed: u64)
     val norm = T(max1(n, n)) * norm1(n, n, (i, j) -> s[i + j * n])
     for uplo in [Uplo.Lower, Uplo.Upper]
         check_eig_of(uplo, s.view(), n, n)
-        val f = copy_of(s.view())
-        val w: Buf[T] = buf_filled(n, T.nan())
-        assert(eig(Eigen.Values, uplo, matrix_mut(f.view(), n, n, n), w.view()) == Ok(()))
+        var f = copy_of(s.view())
+        var w: Buf[T] = buf_filled(n, T.nan())
+        assert(eig(Eigen.Values, uplo, matrix_mut(f.view_mut(), n, n, n), w.view_mut()) == Ok(()))
         for i in 0..<n
             val d = ratio_of((w[i] - sorted[i]).abs(), norm)
             assert(d < T(threshold), s"eigenvalue $i is ${f64(w[i])} against ${f64(sorted[i])}")
@@ -326,11 +326,11 @@ eig_repeated()
     check_spectrum[f32](lf[..], sf[..], 3)
     // All ones: the eigenvalue n once and zero n − 1 times.
     val n: usize = 30
-    val ones: Buf[f64] = buf_filled(n * n, 1)
+    var ones: Buf[f64] = buf_filled(n * n, 1)
     check_eig_of(Uplo.Lower, ones.view(), n, n)
     check_eig_of(Uplo.Upper, ones.view(), n, n)
-    val w: Buf[f64] = buf_filled(n, 0)
-    assert(eig(Eigen.Values, Uplo.Lower, matrix_mut(ones.view(), n, n, n), w.view()) == Ok(()))
+    var w: Buf[f64] = buf_filled(n, 0)
+    assert(eig(Eigen.Values, Uplo.Lower, matrix_mut(ones.view_mut(), n, n, n), w.view_mut()) == Ok(()))
     for i in 0..<n - 1 do assert(w[i].abs() < 30 * 30 * f64.epsilon())
     assert((w[n - 1] - 30).abs() < 30 * 30 * 30 * f64.epsilon())
 
@@ -345,12 +345,12 @@ private check_scaled_eig[T: Real](scale: T, seed: u64)
     for i in 0..<n * n do big[i] = big[i] * scale
     for uplo in [Uplo.Lower, Uplo.Upper]
         check_eig_of(uplo, big.view(), n, n)
-        val w: Buf[T] = buf_filled(n, T.nan())
-        val ws: Buf[T] = buf_filled(n, T.nan())
-        val f = copy_of(s.view())
-        val fs = copy_of(big.view())
-        assert(eig(Eigen.Values, uplo, matrix_mut(f.view(), n, n, n), w.view()) == Ok(()))
-        assert(eig(Eigen.Values, uplo, matrix_mut(fs.view(), n, n, n), ws.view()) == Ok(()))
+        var w: Buf[T] = buf_filled(n, T.nan())
+        var ws: Buf[T] = buf_filled(n, T.nan())
+        var f = copy_of(s.view())
+        var fs = copy_of(big.view())
+        assert(eig(Eigen.Values, uplo, matrix_mut(f.view_mut(), n, n, n), w.view_mut()) == Ok(()))
+        assert(eig(Eigen.Values, uplo, matrix_mut(fs.view_mut(), n, n, n), ws.view_mut()) == Ok(()))
         val norm = T(n) * norm1(n, n, (i, j) -> s[i + j * n])
         for i in 0..<n
             val d = ratio_of((ws[i] / scale - w[i]).abs(), norm)
@@ -373,19 +373,19 @@ private check_scaled_tri[T: Real](scale: T, seed: u64)
     val e: Buf[T] = buf_filled(n - 1, T.zero())
     for i in 0..<n do d[i] = g.next[T]() * scale
     for i in 0..<n - 1 do e[i] = g.next[T]() * scale
-    val w = copy_of(d.view())
-    val we = copy_of(e.view())
-    val z: Buf[T] = buf_filled(n * n, T.zero())
+    var w = copy_of(d.view())
+    var we = copy_of(e.view())
+    var z: Buf[T] = buf_filled(n * n, T.zero())
     for i in 0..<n do z[i + i * n] = T.one()
-    assert(steqr(w.view(), we.view(), matrix_mut(z.view(), n, n, n)) == Ok(()))
+    assert(steqr(w.view_mut(), we.view_mut(),matrix_mut(z.view_mut(), n, n, n)) == Ok(()))
     assert(ascending(w.view(), n))
     val r = tri_eig_ratio(d.view(), e.view(), matrix(z.view(), n, n, n), w.view())
     assert(r < T(threshold), s"‖T V − V Λ‖ / (n ‖T‖ ε) = ${f64(r)}")
     val o = orth_ratio(matrix(z.view(), n, n, n))
     assert(o < T(threshold), s"‖I − Vᵀ V‖ / (n ε) = ${f64(o)}")
-    val only = copy_of(d.view())
-    val oe = copy_of(e.view())
-    assert(sterf(only.view(), oe.view()) == Ok(()))
+    var only = copy_of(d.view())
+    var oe = copy_of(e.view())
+    assert(sterf(only.view_mut(), oe.view_mut()) == Ok(()))
     val norm = T(n) * norm1(n, n, (i, j) -> if i == j then d[i] else if i == j + 1 then e[j] else if j == i + 1 then e[i] else T.zero())
     for i in 0..<n
         val dd = ratio_of((only[i] - w[i]).abs(), norm)
@@ -396,7 +396,7 @@ eig_subnormal()
     val n: usize = 12
     var g = Stream(31)
     // Small integers, so that 2^-1060 times them is exact.
-    val s: Buf[f64] = buf_filled(n * n, 0)
+    var s: Buf[f64] = buf_filled(n * n, 0)
     for j in 0..<n
         for i in j..<n
             val x = f64(int(g.next[f64]() * 1000))
@@ -406,12 +406,12 @@ eig_subnormal()
     for i in 0..<n * n do tiny[i] = tiny[i] * 0x1p-1060
     for uplo in [Uplo.Lower, Uplo.Upper]
         for eigen in [Eigen.Vectors, Eigen.Values]
-            val w: Buf[f64] = buf_filled(n, 0)
-            val wt: Buf[f64] = buf_filled(n, 0)
-            val f = copy_of(s.view())
-            val ft = copy_of(tiny.view())
-            assert(eig(eigen, uplo, matrix_mut(f.view(), n, n, n), w.view()) == Ok(()))
-            assert(eig(eigen, uplo, matrix_mut(ft.view(), n, n, n), wt.view()) == Ok(()))
+            var w: Buf[f64] = buf_filled(n, 0)
+            var wt: Buf[f64] = buf_filled(n, 0)
+            var f = copy_of(s.view())
+            var ft = copy_of(tiny.view())
+            assert(eig(eigen, uplo, matrix_mut(f.view_mut(), n, n, n), w.view_mut()) == Ok(()))
+            assert(eig(eigen, uplo, matrix_mut(ft.view_mut(), n, n, n), wt.view_mut()) == Ok(()))
             for i in 0..<n
                 val d = (wt[i] - w[i] * 0x1p-1060).abs()
                 assert(d <= 2 * 0x1p-1074, s"eigenvalue $i is ${d / 0x1p-1074} subnormal units off")
@@ -436,11 +436,11 @@ eig_nan()
     for uplo in [Uplo.Lower, Uplo.Upper]
         for eigen in [Eigen.Vectors, Eigen.Values]
             var g = Stream(9)
-            val s = symmetric[f64](&g, n, n)
+            var s = symmetric[f64](&g, n, n)
             s[7 + 3 * n] = f64.nan()
             s[3 + 7 * n] = f64.nan()
-            val w: Buf[f64] = buf_filled(n, 0)
-            assert(unconverged_of(eig(eigen, uplo, matrix_mut(s.view(), n, n, n), w.view())) > 0)
+            var w: Buf[f64] = buf_filled(n, 0)
+            assert(unconverged_of(eig(eigen, uplo, matrix_mut(s.view_mut(), n, n, n), w.view_mut())) > 0)
     var d: [5]f64 = [1, 2, 3, 4, 5]
     var e: [4]f64 = [1, f64.nan(), 1, 1]
     var z: [25]f64
@@ -492,15 +492,15 @@ eig_block_view()
     val alone = symmetric[f64](&g, n, n)
     val ld: usize = 90
     for uplo in [Uplo.Lower, Uplo.Upper]
-        val big: Buf[f64] = buf_filled(ld * (n + 4), f64.nan())
+        var big: Buf[f64] = buf_filled(ld * (n + 4), f64.nan())
         for j in 0..<n
             for i in 0..<n
                 if !outside(uplo, i, j) then big[(i + 11) + (j + 4) * ld] = alone[i + j * n]
-        val a = copy_of(alone.view())
-        val w1: Buf[f64] = buf_filled(n, 0)
-        val w2: Buf[f64] = buf_filled(n, 0)
-        assert(eig(Eigen.Vectors, uplo, matrix_mut(a.view(), n, n, n), w1.view()) == Ok(()))
-        assert(eig(Eigen.Vectors, uplo, matrix_mut(big.view(), ld, n + 4, ld).block(11, 4, n, n), w2.view()) == Ok(()))
+        var a = copy_of(alone.view())
+        var w1: Buf[f64] = buf_filled(n, 0)
+        var w2: Buf[f64] = buf_filled(n, 0)
+        assert(eig(Eigen.Vectors, uplo, matrix_mut(a.view_mut(), n, n, n), w1.view_mut()) == Ok(()))
+        assert(eig(Eigen.Vectors, uplo, matrix_mut(big.view_mut(), ld, n + 4, ld).block(11, 4, n, n), w2.view_mut()) == Ok(()))
         for j in 0..<n
             assert(w1[j] == w2[j])
             for i in 0..<n do assert(a[i + j * n] == big[(i + 11) + (j + 4) * ld])
@@ -512,16 +512,16 @@ eig_block_view()
 eig_row_major_view()
     val n: usize = 50
     var g = Stream(29)
-    val s = symmetric[f64](&g, n, n)
+    var s = symmetric[f64](&g, n, n)
     val norm = f64(n) * norm1(n, n, (i, j) -> s[i + j * n])
     for uplo in [Uplo.Lower, Uplo.Upper]
-        val c = copy_of(s.view())
-        val r = copy_of(s.view())
-        val w1: Buf[f64] = buf_filled(n, 0)
-        val w2: Buf[f64] = buf_filled(n, 0)
-        assert(eig(Eigen.Vectors, uplo, matrix_mut(c.view(), n, n, n), w1.view()) == Ok(()))
-        val rv = matrix_mut(r.view(), n, n, n).t()
-        assert(eig(Eigen.Vectors, uplo, rv, w2.view()) == Ok(()))
+        var c = copy_of(s.view())
+        var r = copy_of(s.view())
+        var w1: Buf[f64] = buf_filled(n, 0)
+        var w2: Buf[f64] = buf_filled(n, 0)
+        assert(eig(Eigen.Vectors, uplo, matrix_mut(c.view_mut(), n, n, n), w1.view_mut()) == Ok(()))
+        val rv = matrix_mut(r.view_mut(), n, n, n).t()
+        assert(eig(Eigen.Vectors, uplo, rv, w2.view_mut()) == Ok(()))
         val ratio = eig_ratio(matrix(s.view(), n, n, n), rv.as_view(), w2.view())
         assert(ratio < f64(threshold), s"‖A V − V Λ‖ / (n ‖A‖ ε) = $ratio on the row-major view")
         assert(orth_ratio(rv.as_view()) < f64(threshold))
@@ -538,15 +538,15 @@ private enough(n: usize) -> (Buf[f64], Buf[f64], Buf[f64], Buf[f64])
 eig_not_square()
     var s: [6]f64 = [1, 2, 3, 4, 5, 6]
     var w: [3]f64
-    val (t, b, pa, pb) = enough(3)
-    _ = syev(Eigen.Values, Uplo.Lower, matrix_mut(s[..], 3, 2, 3), w[..], SyevWork(t.view(), QrWork(b.view(), GemmWork(pa.view(), pb.view()))))
+    var (t, b, pa, pb) = enough(3)
+    _ = syev(Eigen.Values, Uplo.Lower, matrix_mut(s[..], 3, 2, 3), w[..], SyevWork(t.view_mut(), QrWork(b.view_mut(), GemmWork(pa.view_mut(), pb.view_mut()))))
 
 @test("syev traps on a w shorter than A's order", should_trap)
 eig_short_w()
     var s: [9]f64 = [1, 2, 3, 2, 5, 6, 3, 6, 9]
     var w: [2]f64
-    val (t, b, pa, pb) = enough(3)
-    _ = syev(Eigen.Values, Uplo.Lower, matrix_mut(s[..], 3, 3, 3), w[..], SyevWork(t.view(), QrWork(b.view(), GemmWork(pa.view(), pb.view()))))
+    var (t, b, pa, pb) = enough(3)
+    _ = syev(Eigen.Values, Uplo.Lower, matrix_mut(s[..], 3, 3, 3), w[..], SyevWork(t.view_mut(), QrWork(b.view_mut(), GemmWork(pa.view_mut(), pb.view_mut()))))
 
 @test("syev traps on a tri workspace shorter than syev_work_len says", should_trap)
 eig_short_tri()
@@ -566,12 +566,12 @@ eig_short_qr()
 eig_short_gemm()
     val n: usize = 100
     var g = Stream(4)
-    val s = symmetric[f64](&g, n, n)
-    val w: Buf[f64] = buf_filled(n, 0)
+    var s = symmetric[f64](&g, n, n)
+    var w: Buf[f64] = buf_filled(n, 0)
     val len = syev_work_len[f64](Eigen.Vectors, n)
-    val t: Buf[f64] = buf_filled(len.tri, 0)
-    val b: Buf[f64] = buf_filled(len.qr.block, 0)
-    _ = syev(Eigen.Vectors, Uplo.Lower, matrix_mut(s.view(), n, n, n), w.view(), SyevWork(t.view(), QrWork(b.view(), work0())))
+    var t: Buf[f64] = buf_filled(len.tri, 0)
+    var b: Buf[f64] = buf_filled(len.qr.block, 0)
+    _ = syev(Eigen.Vectors, Uplo.Lower, matrix_mut(s.view_mut(), n, n, n), w.view_mut(), SyevWork(t.view_mut(), QrWork(b.view_mut(), work0())))
 
 @test("sytrd traps on a matrix that is not square", should_trap)
 eig_sytrd_not_square()

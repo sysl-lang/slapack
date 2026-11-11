@@ -10,16 +10,16 @@ import sysl.math.min
  */
 private factor[T: Real](a: MatrixMut[T], ipiv: []usize) -> Result[unit, Error]
     val len = getrf_work_len[T](a.rows, a.cols)
-    val pa: Buf[T] = buf_filled(len.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.b, T.zero())
-    getrf(a, ipiv, GemmWork(pa.view(), pb.view()))
+    var pa: Buf[T] = buf_filled(len.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.b, T.zero())
+    getrf(a, ipiv, GemmWork(pa.view_mut(), pb.view_mut()))
 
 /** getrs in buffers of the length getrs_work_len gives. */
 private solve[T: Real](trans: Transpose, lu: Matrix[T], ipiv: []const usize, b: MatrixMut[T])
     val len = getrs_work_len[T](lu.rows, b.cols)
-    val pa: Buf[T] = buf_filled(len.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.b, T.zero())
-    getrs(trans, lu, ipiv, b, GemmWork(pa.view(), pb.view()))
+    var pa: Buf[T] = buf_filled(len.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.b, T.zero())
+    getrs(trans, lu, ipiv, b, GemmWork(pa.view_mut(), pb.view_mut()))
 
 // getrf and getrs against their definitions: systems factored and solved by hand, and generated ones
 // checked by LAPACK's own measures — the factorisation residual ‖PA − LU‖ / (n ‖A‖ ε) and the solve
@@ -108,11 +108,11 @@ private check_random[T: Real](m: usize, n: usize, seed: u64)
     var again = Stream(seed)
     val ld = m + 3
     val original = random[T](&g, m, n, ld, T.nan())
-    val s = random[T](&again, m, n, ld, T.nan())
+    var s = random[T](&again, m, n, ld, T.nan())
     val k = min(m, n)
-    val ipiv: Buf[usize] = buf_filled(k, 0)
-    val f = matrix_mut(s.view(), m, n, ld)
-    assert(factor(f, ipiv.view()) == Ok(()), "a random matrix came out singular")
+    var ipiv: Buf[usize] = buf_filled(k, 0)
+    val f = matrix_mut(s.view_mut(), m, n, ld)
+    assert(factor(f, ipiv.view_mut()) == Ok(()), "a random matrix came out singular")
     for j in 0..<n
         for i in m..<ld
             assert(s[i + j * ld].is_nan(), "getrf wrote a padding row")
@@ -125,9 +125,9 @@ private check_random[T: Real](m: usize, n: usize, seed: u64)
     for trans in [Transpose.NoTrans, Transpose.Trans]
         val nrhs: usize = 3
         val b = random[T](&g, n, nrhs, n, T.zero())
-        val x: Buf[T] = buf_filled(n * nrhs, T.zero())
+        var x: Buf[T] = buf_filled(n * nrhs, T.zero())
         for i in 0..<x.len() do x[i] = b[i]
-        solve(trans, f.as_view(), ipiv.view(), matrix_mut(x.view(), n, nrhs, n))
+        solve(trans, f.as_view(), ipiv.view(), matrix_mut(x.view_mut(), n, nrhs, n))
         val op = if trans == Transpose.NoTrans then a else a.t()
         val r = solve_ratio(op, matrix(x.view(), n, nrhs, n), matrix(b.view(), n, nrhs, n))
         assert(r < T(threshold), s"‖op(A) X − B‖ / (n ‖A‖ ‖X‖ ε) = ${f64(r)} at order $n")
@@ -265,14 +265,14 @@ lu_singular()
  */
 private check_zero_columns[T: Real](n: usize, zeros: []const usize, seed: u64)
     var g = Stream(seed)
-    val s = random[T](&g, n, n, n, T.zero())
+    var s = random[T](&g, n, n, n, T.zero())
     for c in zeros
         for i in 0..<n do s[i + c * n] = T.zero()
     val original: Buf[T] = buf_filled(n * n, T.zero())
     for i in 0..<s.len() do original[i] = s[i]
-    val ipiv: Buf[usize] = buf_filled(n, 0)
-    val f = matrix_mut(s.view(), n, n, n)
-    assert(factor(f, ipiv.view()) == Err(Error.Singular(zeros[0])))
+    var ipiv: Buf[usize] = buf_filled(n, 0)
+    val f = matrix_mut(s.view_mut(), n, n, n)
+    assert(factor(f, ipiv.view_mut()) == Err(Error.Singular(zeros[0])))
     val ratio = factor_ratio(matrix(original.view(), n, n, n), f.as_view(), ipiv.view())
     assert(ratio < T(threshold), s"a singular factorisation's residual is ${f64(ratio)}")
 
@@ -363,16 +363,16 @@ lu_row_major_view()
 lu_blocked_block_view()
     val n: usize = 100
     var g = Stream(11)
-    val alone = random[f64](&g, n, n, n, 0)
+    var alone = random[f64](&g, n, n, n, 0)
     val ld: usize = 130
-    val big: Buf[f64] = buf_filled(ld * (n + 5), f64.nan())
+    var big: Buf[f64] = buf_filled(ld * (n + 5), f64.nan())
     for j in 0..<n
         for i in 0..<n
             big[(i + 20) + (j + 5) * ld] = alone[i + j * n]
-    val p1: Buf[usize] = buf_filled(n, 0)
-    val p2: Buf[usize] = buf_filled(n, 0)
-    assert(factor(matrix_mut(alone.view(), n, n, n), p1.view()) == Ok(()))
-    assert(factor(matrix_mut(big.view(), ld, n + 5, ld).block(20, 5, n, n), p2.view()) == Ok(()))
+    var p1: Buf[usize] = buf_filled(n, 0)
+    var p2: Buf[usize] = buf_filled(n, 0)
+    assert(factor(matrix_mut(alone.view_mut(), n, n, n), p1.view_mut()) == Ok(()))
+    assert(factor(matrix_mut(big.view_mut(), ld, n + 5, ld).block(20, 5, n, n), p2.view_mut()) == Ok(()))
     for j in 0..<n
         assert(p1[j] == p2[j])
         for i in 0..<n
@@ -390,11 +390,11 @@ lu_work_len()
     assert(big.a > 0 && big.b > 0)
     // getrf runs in buffers of exactly that length.
     var g = Stream(2)
-    val s = random[f64](&g, 200, 150, 200, 0)
-    val pa: Buf[f64] = buf_filled(big.a, 0)
-    val pb: Buf[f64] = buf_filled(big.b, 0)
-    val ipiv: Buf[usize] = buf_filled(150, 0)
-    assert(getrf(matrix_mut(s.view(), 200, 150, 200), ipiv.view(), GemmWork(pa.view(), pb.view())) == Ok(()))
+    var s = random[f64](&g, 200, 150, 200, 0)
+    var pa: Buf[f64] = buf_filled(big.a, 0)
+    var pb: Buf[f64] = buf_filled(big.b, 0)
+    var ipiv: Buf[usize] = buf_filled(150, 0)
+    assert(getrf(matrix_mut(s.view_mut(), 200, 150, 200), ipiv.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())) == Ok(()))
 
 @test("getrf traps on a pivot array shorter than min(m, n)", should_trap)
 lu_short_ipiv()
@@ -411,9 +411,9 @@ lu_getf2_short_ipiv()
 @test("getrf traps on packing buffers shorter than getrf_work_len says", should_trap)
 lu_short_work()
     var g = Stream(2)
-    val s = random[f64](&g, 100, 100, 100, 0)
-    val ipiv: Buf[usize] = buf_filled(100, 0)
-    _ = getrf(matrix_mut(s.view(), 100, 100, 100), ipiv.view(), work0())
+    var s = random[f64](&g, 100, 100, 100, 0)
+    var ipiv: Buf[usize] = buf_filled(100, 0)
+    _ = getrf(matrix_mut(s.view_mut(), 100, 100, 100), ipiv.view_mut(), work0())
 
 @test("getrs traps on factors that are not square", should_trap)
 lu_getrs_not_square()

@@ -11,95 +11,95 @@ import sysl.buf.{Buf, buf_filled}
 /** `getrf`, with its packing buffers allocated for the call and freed after it. */
 getrf_alloc[T: Real](a: MatrixMut[T], ipiv: []usize) -> Result[unit, Error]
     val len = getrf_work_len[T](a.rows, a.cols)
-    val pa: Buf[T] = buf_filled(len.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.b, T.zero())
-    getrf(a, ipiv, GemmWork(pa.view(), pb.view()))
+    var pa: Buf[T] = buf_filled(len.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.b, T.zero())
+    getrf(a, ipiv, GemmWork(pa.view_mut(), pb.view_mut()))
 
 /** `getrs`, with its packing buffers allocated for the call and freed after it. */
 getrs_alloc[T: Real](trans: Transpose, lu: Matrix[T], ipiv: []const usize, b: MatrixMut[T])
     val len = getrs_work_len[T](lu.rows, b.cols)
-    val pa: Buf[T] = buf_filled(len.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.b, T.zero())
-    getrs(trans, lu, ipiv, b, GemmWork(pa.view(), pb.view()))
+    var pa: Buf[T] = buf_filled(len.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.b, T.zero())
+    getrs(trans, lu, ipiv, b, GemmWork(pa.view_mut(), pb.view_mut()))
 
 /** `potrf`, with its packing buffers allocated for the call and freed after it. */
 potrf_alloc[T: Real](uplo: Uplo, a: MatrixMut[T]) -> Result[unit, Error]
     val len = potrf_work_len[T](a.rows)
-    val pa: Buf[T] = buf_filled(len.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.b, T.zero())
-    potrf(uplo, a, GemmWork(pa.view(), pb.view()))
+    var pa: Buf[T] = buf_filled(len.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.b, T.zero())
+    potrf(uplo, a, GemmWork(pa.view_mut(), pb.view_mut()))
 
 /** `potrs`, with its packing buffers allocated for the call and freed after it. */
 potrs_alloc[T: Real](uplo: Uplo, f: Matrix[T], b: MatrixMut[T])
     val len = potrs_work_len[T](f.rows, b.cols)
-    val pa: Buf[T] = buf_filled(len.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.b, T.zero())
-    potrs(uplo, f, b, GemmWork(pa.view(), pb.view()))
+    var pa: Buf[T] = buf_filled(len.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.b, T.zero())
+    potrs(uplo, f, b, GemmWork(pa.view_mut(), pb.view_mut()))
 
 /** `geqrf`, with its workspace allocated for the call and freed after it. */
 geqrf_alloc[T: Real](a: MatrixMut[T], tau: []T)
     val len = geqrf_work_len[T](a.rows, a.cols)
-    val block: Buf[T] = buf_filled(len.block, T.zero())
-    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
-    geqrf(a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    var block: Buf[T] = buf_filled(len.block, T.zero())
+    var pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    geqrf(a, tau, QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())))
 
 /** `orgqr`, with its workspace allocated for the call and freed after it. */
 orgqr_alloc[T: Real](a: MatrixMut[T], tau: []const T)
     val len = orgqr_work_len[T](a.rows, a.cols, tau.len)
-    val block: Buf[T] = buf_filled(len.block, T.zero())
-    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
-    orgqr(a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    var block: Buf[T] = buf_filled(len.block, T.zero())
+    var pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    orgqr(a, tau, QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())))
 
 /** `ormqr`, with its workspace allocated for the call and freed after it. */
 ormqr_alloc[T: Real](side: Side, trans: Transpose, a: Matrix[T], tau: []const T, c: MatrixMut[T])
     val len = ormqr_work_len[T](side, c.rows, c.cols, tau.len)
-    val block: Buf[T] = buf_filled(len.block, T.zero())
-    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
-    ormqr(side, trans, a, tau, c, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    var block: Buf[T] = buf_filled(len.block, T.zero())
+    var pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    ormqr(side, trans, a, tau, c, QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())))
 
 /** `sytrd`, with its work vector allocated for the call and freed after it. */
 sytrd_alloc[T: Real](uplo: Uplo, a: MatrixMut[T], d: []T, e: []T, tau: []T)
-    val work: Buf[T] = buf_filled(sytrd_work_len[T](a.rows), T.zero())
-    sytrd(uplo, a, d, e, tau, work.view())
+    var work: Buf[T] = buf_filled(sytrd_work_len[T](a.rows), T.zero())
+    sytrd(uplo, a, d, e, tau, work.view_mut())
 
 /** `orgtr`, with its workspace allocated for the call and freed after it. */
 orgtr_alloc[T: Real](uplo: Uplo, a: MatrixMut[T], tau: []const T)
     val len = orgtr_work_len[T](a.rows)
-    val block: Buf[T] = buf_filled(len.block, T.zero())
-    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
-    orgtr(uplo, a, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    var block: Buf[T] = buf_filled(len.block, T.zero())
+    var pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    orgtr(uplo, a, tau, QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())))
 
 /** `syev`, with its workspace allocated for the call and freed after it. */
 syev_alloc[T: Real](eigen: Eigen, uplo: Uplo, a: MatrixMut[T], w: []T) -> Result[unit, Error]
     val len = syev_work_len[T](eigen, a.rows)
-    val tri: Buf[T] = buf_filled(len.tri, T.zero())
-    val block: Buf[T] = buf_filled(len.qr.block, T.zero())
-    val pa: Buf[T] = buf_filled(len.qr.gemm.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.qr.gemm.b, T.zero())
-    syev(eigen, uplo, a, w, SyevWork(tri.view(), QrWork(block.view(), GemmWork(pa.view(), pb.view()))))
+    var tri: Buf[T] = buf_filled(len.tri, T.zero())
+    var block: Buf[T] = buf_filled(len.qr.block, T.zero())
+    var pa: Buf[T] = buf_filled(len.qr.gemm.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.qr.gemm.b, T.zero())
+    syev(eigen, uplo, a, w, SyevWork(tri.view_mut(), QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut()))))
 
 /** `gebrd`, with its work vector allocated for the call and freed after it. */
 gebrd_alloc[T: Real](a: MatrixMut[T], d: []T, e: []T, tauq: []T, taup: []T)
-    val work: Buf[T] = buf_filled(gebrd_work_len[T](a.rows, a.cols), T.zero())
-    gebrd(a, d, e, tauq, taup, work.view())
+    var work: Buf[T] = buf_filled(gebrd_work_len[T](a.rows, a.cols), T.zero())
+    gebrd(a, d, e, tauq, taup, work.view_mut())
 
 /** `orgbr`, with its workspace allocated for the call and freed after it. */
 orgbr_alloc[T: Real](vect: Reflectors, a: MatrixMut[T], k: usize, tau: []const T)
     val len = orgbr_work_len[T](vect, a.rows, a.cols, k)
-    val block: Buf[T] = buf_filled(len.block, T.zero())
-    val pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
-    orgbr(vect, a, k, tau, QrWork(block.view(), GemmWork(pa.view(), pb.view())))
+    var block: Buf[T] = buf_filled(len.block, T.zero())
+    var pa: Buf[T] = buf_filled(len.gemm.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.gemm.b, T.zero())
+    orgbr(vect, a, k, tau, QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut())))
 
 /** `gesvd`, with its workspace allocated for the call and freed after it. */
 gesvd_alloc[T: Real](jobu: SvdJob, jobvt: SvdJob, a: MatrixMut[T], s: []T, u: MatrixMut[T], vt: MatrixMut[T]) -> Result[unit, Error]
     val len = gesvd_work_len[T](jobu, jobvt, a.rows, a.cols)
-    val bidiag: Buf[T] = buf_filled(len.bidiag, T.zero())
-    val block: Buf[T] = buf_filled(len.qr.block, T.zero())
-    val pa: Buf[T] = buf_filled(len.qr.gemm.a, T.zero())
-    val pb: Buf[T] = buf_filled(len.qr.gemm.b, T.zero())
-    gesvd(jobu, jobvt, a, s, u, vt, SvdWork(bidiag.view(), QrWork(block.view(), GemmWork(pa.view(), pb.view()))))
+    var bidiag: Buf[T] = buf_filled(len.bidiag, T.zero())
+    var block: Buf[T] = buf_filled(len.qr.block, T.zero())
+    var pa: Buf[T] = buf_filled(len.qr.gemm.a, T.zero())
+    var pb: Buf[T] = buf_filled(len.qr.gemm.b, T.zero())
+    gesvd(jobu, jobvt, a, s, u, vt, SvdWork(bidiag.view_mut(), QrWork(block.view_mut(), GemmWork(pa.view_mut(), pb.view_mut()))))
