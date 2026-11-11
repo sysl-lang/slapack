@@ -24,7 +24,7 @@ trademark holders.*
 
 ```hocon
 dependencies {
-  slapack { git = "github.com/sysl-lang/slapack", version = "0.1.1" }
+  slapack { git = "github.com/sysl-lang/slapack", version = "0.1.2" }
 }
 ```
 
